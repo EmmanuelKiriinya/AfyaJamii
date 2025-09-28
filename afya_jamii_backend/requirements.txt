@@ -1,0 +1,43 @@
+# Core Framework
+fastapi==0.115.0
+uvicorn==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.3.4
+python-multipart==0.0.9
+
+# MySQL Database
+sqlmodel==0.0.22
+pymysql==1.1.1
+sqlalchemy==2.0.34
+
+# Authentication & Security
+python-jose[cryptography]==3.3.0        # latest is still 3.3.x
+passlib==1.7.4                           # stable
+bcrypt==4.2.0
+python-dotenv==1.0.1
+
+# LLM Integration
+langchain
+langchain-community
+langchain-groq       # latest that exists
+
+# ML and Data Science
+xgboost==3.0.0
+scikit-learn==1.5.2
+joblib==1.4.2
+numpy==1.26.4
+pandas==2.2.3
+
+# HTTP Clients
+httpx==0.27.2
+requests==2.32.3
+
+# Monitoring & Logging
+structlog==24.2.0
+sentry-sdk==2.17.0
+
+# Production Dependencies
+gunicorn==22.0.0
+python-json-logger==2.0.7
+
+slowapi
