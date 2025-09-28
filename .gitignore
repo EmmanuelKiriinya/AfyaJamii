@@ -170,13 +170,10 @@ cython_debug/
 *.h5
 *.model
 # /data/
-!/data/README.md
+# !/data/README.md
 
 # ML model files (large binary files - DO NOT COMMIT)
 /models/
-*.pkl
-*.joblib
-*.h5
 *.pt
 *.pth
 *.onnx
