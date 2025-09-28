@@ -166,11 +166,10 @@ cython_debug/
 # Data files and ML models
 *.csv
 *.json
-*.pkl
 *.joblib
 *.h5
 *.model
-/data/
+# /data/
 !/data/README.md
 
 # ML model files (large binary files - DO NOT COMMIT)
