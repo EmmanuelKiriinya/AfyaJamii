@@ -1395,47 +1395,193 @@
 
 # app/main.py (relevant changes)
 
-import json
-import numpy as np
-import logging
 from datetime import datetime
+from typing import List
+import json
+import logging
+import time
+
 from fastapi import (
     FastAPI, Depends, HTTPException, status, BackgroundTasks, Request
 )
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlmodel import Session, select
 
+from app.config import settings
+from app.auth import (
+    get_current_active_user, authenticate_user,
+    create_access_token, get_password_hash
+)
+from app.ml_model import risk_model, initialize_model
+from app.llm_groq import afya_llm, initialize_llm_service
+from app.database import get_session, create_db_and_tables
 from app.models import (
     UserDB, VitalsRecord, ConversationHistory,
     UserResponse, UserCreate, UserLogin, VitalsSubmission, CombinedResponse,
     MLModelOutput, LLMAdviceRequest, LLMAdviceResponse, Token
 )
-from app.ml_model import risk_model
-from app.llm_groq import afya_llm
-from app.auth import (
-    get_current_active_user, authenticate_user,
-    create_access_token, get_password_hash
+
+# ────────────── LOGGING ──────────────
+logging.basicConfig(
+    level=getattr(logging, settings.LOG_LEVEL, "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-from app.database import get_session
-
-# ------------------------------------------------------
-# ✅ 1. Create FastAPI instance BEFORE route definitions
-# ------------------------------------------------------
 logger = logging.getLogger("app.main")
-app = FastAPI(title="AfyaJamii API", version="1.0.0")
 
+# ────────────── RATE LIMITER ─────────
+limiter = Limiter(key_func=get_remote_address)
 
-# ------------- JSON Safe Converter -------------
-def json_safe(o):
-    """Convert NumPy types & arrays to Python-native for JSON serialization."""
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-    return o
+# ────────────── FASTAPI APP ─────────
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    description="Afya Jamii AI - Clinical Decision Support System",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+app.state.limiter = limiter
 
+# ────────────── MIDDLEWARES ─────────
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["*"] if settings.DEBUG else ["127.0.0.1"]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS or ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.update({
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "X-XSS-Protection": "1; mode=block",
+    })
+    if not settings.DEBUG and getattr(settings, "CSP_DIRECTIVES", None):
+        response.headers["Content-Security-Policy"] = settings.CSP_DIRECTIVES
+    return response
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(f"Unhandled exception {request.method} {request.url.path}")
+        raise
+    duration = time.time() - start
+    logger.info(f"{request.method} {request.url.path} -> {response.status_code} ({duration:.3f}s) from {request.client.host}")
+    return response
+
+# ────────────── EXCEPTION HANDLERS ─────────
+@app.exception_handler(RateLimitExceeded)
+def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Try again later."})
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    logger.warning(f"HTTPException for {request.method} {request.url.path}: {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception(f"Unhandled exception for {request.method} {request.url.path}")
+    return JSONResponse(status_code=500, content={"detail": "Internal server error — check server logs for details."})
+
+# ────────────── STARTUP ──────────────
+@app.on_event("startup")
+def startup_event():
+    logger.info("Starting Afya Jamii AI startup sequence...")
+    try:
+        create_db_and_tables()
+        logger.info("Database tables created/verified.")
+    except Exception:
+        logger.exception("Database initialization failed")
+        raise RuntimeError("Database initialization failed")
+
+    try:
+        if not initialize_model():
+            raise RuntimeError("initialize_model returned falsy")
+        logger.info("ML model loaded.")
+    except Exception:
+        logger.exception("ML model initialization failed")
+        raise RuntimeError("ML model init failed")
+
+    try:
+        if initialize_llm_service():
+            logger.info("LLM service initialized.")
+        else:
+            logger.warning("LLM initialization returned falsy — running reduced LLM mode")
+    except Exception:
+        logger.exception("LLM initialization raised exception; continuing in limited mode")
+    logger.info("Afya Jamii startup complete.")
+
+# ────────────── HELPERS ──────────────
+def safe_json(obj):
+    """Convert numpy objects to native python types for JSON."""
+    try:
+        return json.loads(json.dumps(obj, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
+    except Exception:
+        return obj
+
+# ────────────── ENDPOINTS ──────────────
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"message": "Afya Jamii AI API is running", "status": "healthy"}
+
+@app.get("/health")
+@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
+async def health_check(request: Request):
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "version": "1.0.0",
+        "services": {
+            "database": "connected",
+            "ml_model": bool(getattr(risk_model, "model", None)),
+            "llm_service": bool(getattr(afya_llm, "llm", None))
+        }
+    }
+
+# ------------ Auth ------------
+@app.post("/api/v1/auth/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+async def signup(request: Request, user_data: UserCreate, session: Session = Depends(get_session)):
+    existing = session.exec(
+        select(UserDB).where((UserDB.username == user_data.username) | (UserDB.email == user_data.email))
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+
+    hashed_pw = get_password_hash(user_data.password)
+    db_user = UserDB(**user_data.dict(exclude={"password"}), hashed_password=hashed_pw)
+    session.add(db_user)
+    session.commit()
+    session.refresh(db_user)
+    logger.info("New user created: %s", db_user.username)
+    return db_user
+
+@app.post("/api/v1/auth/login", response_model=Token)
+@limiter.limit("5/minute")
+async def login(request: Request, login_data: UserLogin, session: Session = Depends(get_session)):
+    user = authenticate_user(session, login_data.username, login_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    token = create_access_token(data={"sub": user.username})
+    logger.info("User logged in: %s", user.username)
+    return Token(access_token=token, token_type="bearer",
+                 expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
 # ------------ Vitals submission ------------
 @app.post("/api/v1/vitals/submit", response_model=CombinedResponse)
@@ -1446,51 +1592,41 @@ async def submit_vitals(
     current_user: UserDB = Depends(get_current_active_user),
     session: Session = Depends(get_session)
 ):
-    """
-    Accept vitals from authenticated user, run ML risk model,
-    generate LLM advice, store record in DB, and return combined response.
-    """
+    features = {
+        "Age": submission.vitals.age,
+        "SystolicBP": submission.vitals.systolic_bp,
+        "DiastolicBP": submission.vitals.diastolic_bp,
+        "BS": submission.vitals.bs,
+        "BodyTemp": submission.vitals.body_temp,
+        "HeartRate": submission.vitals.heart_rate,
+    }
+
     try:
-        logger.debug("submit_vitals payload: %s", submission.dict())
-
-        features = {
-            "Age": submission.vitals.age,
-            "SystolicBP": submission.vitals.systolic_bp,
-            "DiastolicBP": submission.vitals.diastolic_bp,
-            "BS": submission.vitals.bs,
-            "BodyTemp": submission.vitals.body_temp,
-            "HeartRate": submission.vitals.heart_rate,
-        }
-
-        # Run ML model & force Python-native types
-        raw_label, raw_prob, raw_feat_imp = risk_model.predict(features)
-        risk_label = str(raw_label)
-        prob = float(raw_prob)  # ensure float
-        feat_imp = json_safe(raw_feat_imp)  # ensure safe for JSON
+        risk_label, prob, feat_imp = risk_model.predict(features)
 
         vitals_record = VitalsRecord(
             user_id=current_user.id,
             **submission.vitals.dict(),
-            ml_risk_label=risk_label,
-            ml_probability=prob,
-            ml_feature_importances=json.dumps(feat_imp, default=json_safe) if feat_imp else None
+            ml_risk_label=str(risk_label),
+            ml_probability=float(prob),
+            ml_feature_importances=json.dumps(safe_json(feat_imp))
         )
         session.add(vitals_record)
         session.commit()
         session.refresh(vitals_record)
 
         ml_output = MLModelOutput(
-            risk_label=risk_label,
-            probability=prob,
-            feature_importances=feat_imp
+            risk_label=str(risk_label),
+            probability=float(prob),
+            feature_importances=safe_json(feat_imp)
         )
 
         llm_prompt_data = {
             **features,
             "account_type": submission.account_type.value,
-            "ml_model_output": risk_label,
-            "probability": prob,
-            "feature_importances": feat_imp,
+            "ml_model_output": str(risk_label),
+            "probability": float(prob),
+            "feature_importances": safe_json(feat_imp),
             "patient_history": submission.vitals.patient_history or "No history",
             "question": "Provide initial risk assessment.",
             "history": ""
@@ -1520,9 +1656,76 @@ async def submit_vitals(
             ml_output=ml_output,
             llm_advice=llm_advice
         )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Vitals submission failed: %s", str(e))
+    except Exception:
+        logger.exception("Vitals submission failed")
         raise HTTPException(status_code=500, detail="Vitals submission failed - see server logs")
+
+# ------------ LLM Chat Endpoint ------------
+@app.post("/api/v1/chat/advice", response_model=LLMAdviceResponse)
+async def get_llm_advice(
+    request: Request,
+    advice_request: LLMAdviceRequest,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session)
+):
+    """Let user ask follow-up questions based on last vitals."""
+    latest = session.exec(
+        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
+        .order_by(VitalsRecord.created_at.desc()).limit(1)
+    ).first()
+    if not latest:
+        raise HTTPException(status_code=400, detail="No health data available.")
+
+    llm_prompt_data = {
+        "age": latest.age,
+        "systolic_bp": latest.systolic_bp,
+        "diastolic_bp": latest.diastolic_bp,
+        "bs": latest.bs,
+        "body_temp": latest.body_temp,
+        "temp_unit": latest.body_temp_unit,
+        "heart_rate": latest.heart_rate,
+        "account_type": current_user.account_type.value,
+        "ml_model_output": latest.ml_risk_label,
+        "probability": latest.ml_probability,
+        "feature_importances": json.loads(latest.ml_feature_importances or "{}"),
+        "patient_history": latest.patient_history or "No history",
+        "question": advice_request.question
+    }
+
+    try:
+        advice = afya_llm.generate_advice(llm_prompt_data)
+    except Exception:
+        logger.exception("LLM advice retrieval failed - continuing without LLM")
+        advice = "LLM currently unavailable; please consult a clinician."
+
+    convo = ConversationHistory(
+        user_id=current_user.id,
+        vitals_record_id=latest.id,
+        user_message=advice_request.question,
+        ai_response=advice
+    )
+    session.add(convo)
+    session.commit()
+
+    return LLMAdviceResponse(advice=advice, timestamp=datetime.utcnow())
+
+# ------------ History ------------
+@app.get("/api/v1/history/vitals", response_model=List[VitalsRecord])
+async def get_vitals_history(request: Request, limit: int = 10,
+                             current_user: UserDB = Depends(get_current_active_user),
+                             session: Session = Depends(get_session)):
+    records = session.exec(
+        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
+        .order_by(VitalsRecord.created_at.desc()).limit(limit)
+    ).all()
+    return records
+
+@app.get("/api/v1/history/conversations", response_model=List[ConversationHistory])
+async def get_conversation_history(request: Request, limit: int = 20,
+                                   current_user: UserDB = Depends(get_current_active_user),
+                                   session: Session = Depends(get_session)):
+    convos = session.exec(
+        select(ConversationHistory).where(ConversationHistory.user_id == current_user.id)
+        .order_by(ConversationHistory.created_at.desc()).limit(limit)
+    ).all()
+    return convos

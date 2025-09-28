@@ -44,7 +44,7 @@ class Settings(BaseSettings):
 
     # Groq LLM
     GROQ_API_KEY: str
-    LLM_MODEL_NAME: str = "openai/gpt-oss-20b"
+    LLM_MODEL_NAME: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     LLM_TEMPERATURE: float = 0.0
 
     # App Environment
