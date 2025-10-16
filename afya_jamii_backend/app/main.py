@@ -1621,15 +1621,22 @@ async def submit_vitals(
             feature_importances=safe_json(feat_imp)
         )
 
+        context = f"""The user has just submitted their vitals.
+Patient Data:
+- Age: {submission.vitals.age} years
+- Blood Pressure: {submission.vitals.systolic_bp}/{submission.vitals.diastolic_bp} mmHg
+- Blood Sugar: {submission.vitals.bs} mmol/L
+- Body Temperature: {submission.vitals.body_temp}°{submission.vitals.body_temp_unit}
+- Heart Rate: {submission.vitals.heart_rate} bpm
+- Account Type: {submission.account_type.value}
+- Model Prediction: {str(risk_label)} (Probability: {float(prob):.2f})
+- Feature Importances: {safe_json(feat_imp)}
+- Patient History: {submission.vitals.patient_history or "No history"}
+"""
         llm_prompt_data = {
-            **features,
-            "account_type": submission.account_type.value,
-            "ml_model_output": str(risk_label),
-            "probability": float(prob),
-            "feature_importances": safe_json(feat_imp),
-            "patient_history": submission.vitals.patient_history or "No history",
-            "question": "Provide initial risk assessment.",
-            "history": ""
+            "context": context,
+            "history": "", # No history on the first turn
+            "question": "Provide initial risk assessment and recommendations based on the vitals data."
         }
 
         try:
@@ -1668,27 +1675,22 @@ async def get_llm_advice(
     current_user: UserDB = Depends(get_current_active_user),
     session: Session = Depends(get_session)
 ):
-    """Let user ask follow-up questions based on last vitals."""
-    latest = session.exec(
-        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
-        .order_by(VitalsRecord.created_at.desc()).limit(1)
-    ).first()
-    if not latest:
-        raise HTTPException(status_code=400, detail="No health data available.")
+    """Let user ask follow-up questions."""
+    # Fetch conversation history
+    history_records = session.exec(
+        select(ConversationHistory)
+        .where(ConversationHistory.user_id == current_user.id)
+        .order_by(ConversationHistory.created_at.asc())
+    ).all()
+
+    # Format history for the prompt
+    history = "\n".join(
+        [f"User: {rec.user_message}\nAI: {rec.ai_response}" for rec in history_records]
+    )
 
     llm_prompt_data = {
-        "age": latest.age,
-        "systolic_bp": latest.systolic_bp,
-        "diastolic_bp": latest.diastolic_bp,
-        "bs": latest.bs,
-        "body_temp": latest.body_temp,
-        "temp_unit": latest.body_temp_unit,
-        "heart_rate": latest.heart_rate,
-        "account_type": current_user.account_type.value,
-        "ml_model_output": latest.ml_risk_label,
-        "probability": latest.ml_probability,
-        "feature_importances": json.loads(latest.ml_feature_importances or "{}"),
-        "patient_history": latest.patient_history or "No history",
+        "context": "The user is asking a follow-up question.",
+        "history": history,
         "question": advice_request.question
     }
 
@@ -1698,9 +1700,15 @@ async def get_llm_advice(
         logger.exception("LLM advice retrieval failed - continuing without LLM")
         advice = "LLM currently unavailable; please consult a clinician."
 
+    # Get the latest vitals record to associate the conversation
+    latest_vitals = session.exec(
+        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
+        .order_by(VitalsRecord.created_at.desc()).limit(1)
+    ).first()
+
     convo = ConversationHistory(
         user_id=current_user.id,
-        vitals_record_id=latest.id,
+        vitals_record_id=latest_vitals.id if latest_vitals else None,
         user_message=advice_request.question,
         ai_response=advice
     )
