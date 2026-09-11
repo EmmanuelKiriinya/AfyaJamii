@@ -64,6 +64,26 @@ export interface UserProfile {
   is_active: boolean;
 }
 
+export interface ProfileUpdate {
+  username?: string;
+  email?: string;
+  full_name?: string;
+  account_type?: AccountType;
+}
+
+/** A profile, plus a replacement token when the username changed. */
+export interface ProfileResponse extends UserProfile {
+  access_token?: string | null;
+}
+
+export interface DeletionSummary {
+  detail: string;
+  username: string;
+  vitals_records_deleted: number;
+  conversations_deleted: number;
+  deleted_at: string;
+}
+
 export interface VitalsData {
   age: number;
   systolic_bp: number;
@@ -171,7 +191,7 @@ function describeError(body: ErrorBody | null, status: number): string {
 }
 
 interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
   body?: unknown;
   token?: string;
   signal?: AbortSignal;
@@ -249,4 +269,28 @@ export const api = {
 
   getConversationsHistory: (token: string, limit = 20) =>
     request<ConversationRecord[]>(`/api/v1/history/conversations?limit=${limit}`, { token }),
+
+  // ── Account settings ────────────────────────────────────────────────────
+
+  getProfile: (token: string) => request<UserProfile>("/api/v1/users/me", { token }),
+
+  updateProfile: (updates: ProfileUpdate, token: string) =>
+    request<ProfileResponse>("/api/v1/users/me", { method: "PATCH", body: updates, token }),
+
+  changePassword: (current_password: string, new_password: string, token: string) =>
+    request<void>("/api/v1/users/me/password", {
+      method: "POST",
+      body: { current_password, new_password },
+      token,
+    }),
+
+  deactivateAccount: (token: string) =>
+    request<void>("/api/v1/users/me/deactivate", { method: "POST", token }),
+
+  deleteAccount: (password: string, confirmation: string, token: string) =>
+    request<DeletionSummary>("/api/v1/users/me", {
+      method: "DELETE",
+      body: { password, confirmation },
+      token,
+    }),
 };

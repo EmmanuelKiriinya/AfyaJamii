@@ -349,7 +349,7 @@ class Settings(BaseSettings):
         """Resolve a possibly-relative path against the backend root.
 
         This keeps paths working regardless of the process's working directory,
-        which differs between `uvicorn app.main:app`, Docker, and systemd.
+        which differs between `uvicorn app.main:app` and systemd.
         """
         candidate = Path(path)
         return candidate if candidate.is_absolute() else (BASE_DIR / candidate).resolve()

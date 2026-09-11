@@ -35,7 +35,11 @@ const Login = () => {
       const session = await api.login({ username: username.trim(), password });
       // The account type comes from the server, so the dashboard shows the
       // right guidance instead of assuming "general".
-      signIn(session);
+      //
+      // `username` is backfilled from what was typed: we already know it, and
+      // an older API build does not echo it back, which would otherwise greet
+      // the user as "undefined".
+      signIn({ ...session, username: session.username || username.trim() });
       toast({
         title: "Success",
         description: "Logged in successfully",

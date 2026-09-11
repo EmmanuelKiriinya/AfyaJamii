@@ -319,3 +319,75 @@ def test_deletion_requires_authentication(client):
         json={"password": PASSWORD, "confirmation": "DELETE MY ACCOUNT"},
     )
     assert response.status_code == 401
+
+
+# ── Username changes ───────────────────────────────────────────────────────
+
+def test_username_can_be_changed_and_a_new_token_is_issued(client, account):
+    new_name = f"renamed_{uuid.uuid4().hex[:8]}"
+
+    response = client.patch(
+        "/api/v1/users/me", json={"username": new_name}, headers=account["headers"]
+    )
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["username"] == new_name
+    # The old token names the previous username as its subject, so a
+    # replacement has to come back or the caller is locked out mid-edit.
+    assert body["access_token"], "no replacement token was issued"
+
+    fresh = {"Authorization": f"Bearer {body['access_token']}"}
+    assert client.get("/api/v1/users/me", headers=fresh).json()["username"] == new_name
+
+    # And the new name is what signs in from now on.
+    assert (
+        client.post(
+            "/api/v1/auth/login", json={"username": new_name, "password": PASSWORD}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/v1/auth/login",
+            json={"username": account["username"], "password": PASSWORD},
+        ).status_code
+        == 401
+    )
+
+
+def test_no_token_is_issued_when_the_username_is_unchanged(client, account):
+    response = client.patch(
+        "/api/v1/users/me", json={"full_name": "Same Name"}, headers=account["headers"]
+    )
+    assert response.status_code == 200
+    assert response.json()["access_token"] is None
+
+
+def test_username_cannot_collide_with_another_account(client, account):
+    taken = f"taken_{uuid.uuid4().hex[:8]}"
+    client.post(
+        "/api/v1/auth/signup",
+        json={
+            "username": taken,
+            "email": f"{taken}@example.co.ke",
+            "full_name": "Other",
+            "account_type": "general",
+            "password": PASSWORD,
+        },
+    )
+
+    response = client.patch(
+        "/api/v1/users/me", json={"username": taken}, headers=account["headers"]
+    )
+    assert response.status_code == 409
+    # The original name must survive a rejected rename.
+    assert client.get("/api/v1/users/me", headers=account["headers"]).json()["username"] == account["username"]
+
+
+@pytest.mark.parametrize("bad", ["ab", "has spaces", "sym$bol", "x" * 51])
+def test_invalid_usernames_are_rejected(client, account, bad):
+    response = client.patch(
+        "/api/v1/users/me", json={"username": bad}, headers=account["headers"]
+    )
+    assert response.status_code == 422

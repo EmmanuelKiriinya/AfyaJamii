@@ -29,6 +29,14 @@ interface AuthContextValue {
   isLoading: boolean;
   signIn: (session: AuthSession) => void;
   signOut: () => void;
+  /**
+   * Patch the stored session in place.
+   *
+   * Needed by account settings: renaming the account changes the username the
+   * header shows, and the API returns a replacement token because the old one
+   * names the previous username as its subject.
+   */
+  updateSession: (changes: Partial<Omit<StoredSession, "expiresAt">>) => void;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
@@ -115,6 +123,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setSession(next);
   }, []);
 
+  const updateSession = useCallback((changes: Partial<Omit<StoredSession, "expiresAt">>) => {
+    setSession((current) => {
+      if (!current) return current;
+      const next = { ...current, ...changes };
+      writeStoredSession(next);
+      return next;
+    });
+  }, []);
+
   const signOut = useCallback(() => {
     writeStoredSession(null);
     setSession(null);
@@ -129,8 +146,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isLoading,
       signIn,
       signOut,
+      updateSession,
     }),
-    [session, isLoading, signIn, signOut],
+    [session, isLoading, signIn, signOut, updateSession],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

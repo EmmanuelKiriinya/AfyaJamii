@@ -1,0 +1,88 @@
+# Render deployment for the Afya Jamii API.
+#
+# Committing this makes the service reproducible: the build and start commands
+# live with the code rather than only in the dashboard, and every environment
+# variable the app needs is listed in one place.
+#
+# Render reads this as a Blueprint. On an existing service created through the
+# dashboard, either point the service at this Blueprint or copy the commands
+# and variables below into its settings.
+
+services:
+  - type: web
+    name: afyajamii-api
+    runtime: python
+    plan: free
+    region: frankfurt
+    rootDir: afya_jamii_backend
+    healthCheckPath: /health
+
+    # The lock file pins the fully resolved environment.
+    buildCommand: pip install --upgrade pip && pip install -r requirements.lock.txt
+
+    # One Uvicorn worker fits the free tier's memory; xgboost and scikit-learn
+    # are loaded per worker, so raise this only with the instance size.
+    startCommand: >-
+      gunicorn app.main:app
+      --worker-class uvicorn.workers.UvicornWorker
+      --workers 1
+      --bind 0.0.0.0:$PORT
+      --timeout 120
+      --graceful-timeout 30
+      --access-logfile -
+      --error-logfile -
+
+    envVars:
+      # ── Values that must change from the previous release ───────────────
+      # v1.0.0 validates its configuration at start-up and refuses to run with
+      # DEBUG on in production, or with a wildcard host. The previous release
+      # defaulted to exactly that combination, so a deploy without these
+      # changes exits instead of serving traffic.
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: RELOAD
+        value: "false"
+      - key: ALLOWED_HOSTS
+        value: afyajamii.onrender.com
+      - key: CORS_ORIGINS
+        value: https://afya-jamii.vercel.app
+
+      # ── Secrets: set these in the Render dashboard, never in this file ──
+      # SECRET_KEY must be at least 32 characters and stable across restarts;
+      # changing it signs every user out.
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # ── Database transport security ────────────────────────────────────
+      # Aiven accepts unencrypted connections unless the client requests TLS,
+      # so this must not be left at `disable`. Set DB_SSL_CA and switch to
+      # `verify` once the provider's CA certificate is available.
+      - key: DB_SSL_MODE
+        value: require
+
+      # ── Application ────────────────────────────────────────────────────
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FORMAT
+        value: json
+      - key: LLM_MODEL_NAME
+        value: openai/gpt-oss-120b
+      - key: LLM_TEMPERATURE
+        value: "0.2"
+      - key: PROMPT_NAME
+        value: clinical_assistant
+      - key: CHAT_HISTORY_TURNS
+        value: "10"
+      - key: CHAT_HISTORY_CHAR_BUDGET
+        value: "6000"
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+
+      - key: PYTHON_VERSION
+        value: "3.12.7"

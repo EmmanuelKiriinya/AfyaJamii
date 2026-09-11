@@ -86,10 +86,18 @@ class UserUpdate(BaseModel):
     """A partial update of the signed-in user's profile.
 
     Every field is optional; only those present in the request body are
-    changed. The username is deliberately not editable — it identifies the
-    account and appears in issued tokens.
+    changed. Changing the username invalidates the caller's current token,
+    because the username is the token's subject — the endpoint issues a
+    replacement rather than signing the user out mid-edit.
     """
 
+    username: Optional[str] = Field(
+        None,
+        min_length=3,
+        max_length=50,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        description="Letters, digits, underscore, dot, and hyphen only",
+    )
     email: Optional[EmailStr] = None
     full_name: Optional[str] = Field(None, max_length=100)
     account_type: Optional[AccountType] = None
@@ -99,6 +107,19 @@ class UserUpdate(BaseModel):
         if self.model_fields_set == set():
             raise ValueError("Provide at least one field to update")
         return self
+
+
+class ProfileResponse(UserResponse):
+    """The updated profile, plus a new token when the username changed.
+
+    Additive: every field of UserResponse is still present, so a client that
+    ignores `access_token` keeps working.
+    """
+
+    access_token: Optional[str] = Field(
+        None,
+        description="A replacement token, present only when the username changed",
+    )
 
 
 class PasswordChange(BaseModel):

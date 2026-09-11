@@ -86,7 +86,12 @@ const Signup = () => {
         username: formData.username.trim(),
         password: formData.password,
       });
-      signIn(session);
+      // Backfill from what was submitted — see the note in Login.tsx.
+      signIn({
+        ...session,
+        username: session.username || formData.username.trim(),
+        account_type: session.account_type || (formData.account_type as AccountType),
+      });
 
       toast({
         title: "Success",

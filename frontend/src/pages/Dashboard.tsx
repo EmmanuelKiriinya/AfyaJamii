@@ -10,6 +10,7 @@ import VitalsForm from "@/components/VitalsForm";
 import RiskAssessment from "@/components/RiskAssessment";
 import ChatInterface from "@/components/ChatInterface";
 import HistoryView from "@/components/HistoryView";
+import AccountSettings from "@/components/AccountSettings";
 import type { VitalsSubmitResponse } from "@/lib/api";
 import logo from "@/assets/logo.png";
 
@@ -23,7 +24,7 @@ import logo from "@/assets/logo.png";
  * user's most recent result.
  */
 
-type View = "overview" | "record" | "ask" | "history";
+type View = "overview" | "record" | "ask" | "history" | "settings";
 
 const NAV: { view: View; icon: IconName; label: string; hint: string }[] = [
   { view: "overview", icon: "care", label: "Overview", hint: "How you are doing" },
@@ -105,7 +106,12 @@ const Dashboard = () => {
           </nav>
 
           <div className="border-t p-4">
-            <div className="mb-3 flex items-center gap-3 px-1">
+            <button
+              type="button"
+              onClick={() => go("settings")}
+              aria-label="Account settings"
+              className="mb-3 flex w-full items-center gap-3 rounded-lg px-1 py-1 text-left transition-colors hover:bg-primary/5"
+            >
               <div className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-primary to-purple-600 text-sm font-semibold text-primary-foreground">
                 {username?.slice(0, 1).toUpperCase() ?? "?"}
               </div>
@@ -115,11 +121,21 @@ const Dashboard = () => {
                   {accountType ? ACCOUNT_LABELS[accountType] ?? accountType : ""}
                 </p>
               </div>
+            </button>
+            <div className="flex gap-2">
+              <Button
+                variant={view === "settings" ? "default" : "outline"}
+                size="sm"
+                className="flex-1"
+                onClick={() => go("settings")}
+              >
+                <Icon name="settings" size={15} className="mr-2" />
+                Settings
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleSignOut} aria-label="Sign out">
+                <Icon name="logout" size={15} />
+              </Button>
             </div>
-            <Button variant="outline" size="sm" className="w-full" onClick={handleSignOut}>
-              <Icon name="logout" size={15} className="mr-2" />
-              Sign out
-            </Button>
           </div>
         </aside>
 
@@ -141,9 +157,11 @@ const Dashboard = () => {
                   <div>
                     <h1 className="text-lg font-bold sm:text-xl">
                       <span className="lg:hidden">AfyaJamii</span>
-                      <span className="hidden lg:inline">{active?.label}</span>
+                      <span className="hidden lg:inline">{active?.label ?? "Settings"}</span>
                     </h1>
-                    <p className="hidden text-xs text-muted-foreground lg:block">{active?.hint}</p>
+                    <p className="hidden text-xs text-muted-foreground lg:block">
+                      {active?.hint ?? "Your details, password and account"}
+                    </p>
                     <p className="text-xs text-muted-foreground lg:hidden">
                       Welcome back, {username}
                     </p>
@@ -157,6 +175,15 @@ const Dashboard = () => {
                     {ACCOUNT_LABELS[accountType] ?? accountType}
                   </span>
                 ) : null}
+                <Button
+                  variant={view === "settings" ? "secondary" : "ghost"}
+                  size="sm"
+                  onClick={() => go("settings")}
+                  className="lg:hidden"
+                  aria-label="Account settings"
+                >
+                  <Icon name="settings" size={18} />
+                </Button>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -185,6 +212,8 @@ const Dashboard = () => {
             {view === "ask" ? <ChatInterface /> : null}
 
             {view === "history" ? <HistoryView /> : null}
+
+            {view === "settings" ? <AccountSettings /> : null}
           </main>
 
           <footer className="border-t px-4 py-5 sm:px-6 lg:px-8">

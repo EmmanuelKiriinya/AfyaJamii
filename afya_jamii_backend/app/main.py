@@ -64,6 +64,7 @@ from app.models import (
     LLMAdviceResponse,
     MLModelOutput,
     PasswordChange,
+    ProfileResponse,
     Token,
     UserCreate,
     UserDB,
@@ -495,20 +496,39 @@ async def get_profile(current_user: UserDB = Depends(get_current_active_user)) -
     return current_user
 
 
-@app.patch(f"{settings.API_V1_STR}/users/me", response_model=UserResponse, tags=["settings"])
+@app.patch(f"{settings.API_V1_STR}/users/me", response_model=ProfileResponse, tags=["settings"])
 async def update_profile(
     request: Request,
     updates: UserUpdate,
     current_user: UserDB = Depends(get_current_active_user),
     session: Session = Depends(get_session),
-) -> UserDB:
+) -> ProfileResponse:
     """Change the profile fields a user is allowed to edit.
 
-    The username is not editable: it identifies the account and is the subject
-    of every issued token, so changing it would invalidate the caller's own
-    session mid-request.
+    Only the fields present in the request body are touched.
+
+    Changing the username is allowed, but the username is the subject of every
+    issued token — the caller's existing token would stop validating the
+    moment the row changed. A replacement is returned in ``access_token`` so
+    the client can swap it and carry on, rather than being signed out in the
+    middle of editing a profile.
     """
     changes = updates.model_dump(exclude_unset=True)
+    previous_username = current_user.username
+
+    # Both columns are unique; check before writing so the caller gets a clear
+    # 409 rather than an integrity error surfacing as a 500.
+    if "username" in changes and changes["username"] != previous_username:
+        clash = session.exec(
+            select(UserDB).where(
+                UserDB.username == changes["username"], UserDB.id != current_user.id
+            )
+        ).first()
+        if clash is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="That username is already taken",
+            )
 
     if "email" in changes:
         clash = session.exec(
@@ -528,8 +548,15 @@ async def update_profile(
     session.commit()
     session.refresh(current_user)
 
+    renamed = current_user.username != previous_username
+    if renamed:
+        logger.info("Username changed: %s -> %s", previous_username, current_user.username)
     logger.info("Profile updated for %s: %s", current_user.username, ", ".join(changes))
-    return current_user
+
+    return ProfileResponse(
+        **current_user.model_dump(exclude={"hashed_password", "updated_at"}),
+        access_token=create_access_token(data={"sub": current_user.username}) if renamed else None,
+    )
 
 
 @app.post(

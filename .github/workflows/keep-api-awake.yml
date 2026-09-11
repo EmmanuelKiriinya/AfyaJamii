@@ -1,0 +1,84 @@
+# Keeps the Render free-tier API from sleeping, and doubles as an uptime check.
+#
+# Render spins a free service down after ~15 minutes without traffic, and the
+# cold start that follows takes the better part of a minute — long enough that
+# a mother tapping "Sign in" sees a spinner and assumes the app is broken.
+#
+# Interval: every 10 minutes rather than 14. GitHub's scheduled workflows are
+# best-effort and are frequently delayed by 5-15 minutes when the shared
+# runners are busy, so a 14-minute schedule would regularly land past the
+# 15-minute idle window — exactly when it is needed. Ten minutes leaves room
+# for a late run and still costs nothing.
+#
+# Note on Render's free allowance: keeping one service awake around the clock
+# uses roughly 730 of the 750 free instance-hours a month. That is fine for a
+# single service and leaves almost nothing for a second one.
+#
+# This becomes unnecessary once the API moves to FastAPI Cloud. Either delete
+# the file or switch it off under Actions.
+
+name: Keep API awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  # Lets you run it by hand from the Actions tab to check it works.
+  workflow_dispatch:
+
+# Never let a slow cold start pile up into overlapping runs.
+concurrency:
+  group: keep-api-awake
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping the health endpoint
+        env:
+          # Set API_URL as a repository variable (Settings -> Secrets and
+          # variables -> Actions -> Variables) to point this elsewhere without
+          # editing the workflow.
+          API_URL: ${{ vars.API_URL || 'https://afyajamii.onrender.com' }}
+        run: |
+          set -euo pipefail
+
+          echo "Pinging ${API_URL}/health"
+
+          # --max-time 120 covers a full cold start; the retries cover the
+          # case where Render returns 502 while the instance is still booting.
+          http_status=$(
+            curl --silent --show-error \
+                 --location \
+                 --max-time 120 \
+                 --retry 4 \
+                 --retry-delay 15 \
+                 --retry-all-errors \
+                 --write-out '%{http_code}' \
+                 --output response.json \
+                 "${API_URL}/health"
+          )
+
+          echo "HTTP ${http_status}"
+          cat response.json || true
+          echo
+
+          if [ "$http_status" != "200" ]; then
+            echo "::error::Health check returned HTTP ${http_status}"
+            exit 1
+          fi
+
+          # /health reports "degraded" when the core service is up but advice
+          # generation is not. That is worth surfacing, but it is not a reason
+          # to fail the run — the API is still serving.
+          service_status=$(python3 -c "import json;print(json.load(open('response.json')).get('status','unknown'))")
+          echo "Service status: ${service_status}"
+
+          if [ "$service_status" = "degraded" ]; then
+            echo "::warning::API is up but degraded — check GROQ_API_KEY and the database."
+          fi
