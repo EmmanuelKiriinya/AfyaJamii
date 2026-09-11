@@ -1,343 +1,907 @@
+"""Afya Jamii AI — HTTP API.
 
-from datetime import datetime
-from typing import List
+A maternal health service that scores submitted vitals with a risk model and
+turns that score into plain-language guidance with a language model.
+
+Start-up policy: the database and the risk model are required, and the process
+exits if either is unavailable. The language model is optional — if it cannot
+be reached, vitals capture, risk scoring, authentication, and history all keep
+working, and advice endpoints report that guidance is temporarily unavailable.
+"""
+
+# NOTE: `from __future__ import annotations` is deliberately not used here.
+# It turns every endpoint signature into a string annotation, which FastAPI
+# cannot resolve when it builds the request models, producing
+# "PydanticUndefinedAnnotation: name 'UserCreate' is not defined" at import.
+
 import json
 import logging
 import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from fastapi import (
-    FastAPI, Depends, HTTPException, status, BackgroundTasks, Request
-)
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
-
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
-from app.config import settings
 from app.auth import (
-    get_current_active_user, authenticate_user,
-    create_access_token, get_password_hash
+    authenticate_user,
+    create_access_token,
+    get_current_active_user,
+    get_password_hash,
+    verify_password,
 )
-from app.ml_model import risk_model, initialize_model
-from app.llm_groq import afya_llm, initialize_llm_service
-from app.database import get_session, create_db_and_tables
+from app.config import settings
+from app.database import (
+    check_connection,
+    create_db_and_tables,
+    dispose_engine,
+    get_session,
+    pool_stats,
+)
+from app.llm_groq import UNAVAILABLE_MESSAGE, LLMUnavailableError, afya_llm, initialize_llm_service
+from app.logging_config import configure_logging, request_id_var
+from app.ml_model import InvalidFeaturesError, ModelNotLoadedError, initialize_model, risk_model
 from app.models import (
-    UserDB, VitalsRecord, ConversationHistory,
-    UserResponse, UserCreate, UserLogin, VitalsSubmission, CombinedResponse,
-    MLModelOutput, LLMAdviceRequest, LLMAdviceResponse, Token
+    AccountDeletion,
+    AccountType,
+    CombinedResponse,
+    ConversationHistory,
+    ConversationResponse,
+    DeletionSummary,
+    HealthResponse,
+    LLMAdviceRequest,
+    LLMAdviceResponse,
+    MLModelOutput,
+    PasswordChange,
+    Token,
+    UserCreate,
+    UserDB,
+    UserLogin,
+    UserResponse,
+    UserUpdate,
+    VitalsInput,
+    VitalsRecord,
+    VitalsRecordResponse,
+    VitalsSubmission,
+    utcnow,
 )
 
-# ────────────── LOGGING ──────────────
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL, "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+configure_logging()
+logger = logging.getLogger("afya_jamii.api")
+
+limiter = Limiter(
+    key_func=get_remote_address,
+    enabled=settings.RATE_LIMIT_ENABLED,
+    default_limits=[settings.RATE_LIMIT_DEFAULT],
 )
-logger = logging.getLogger("app.main")
 
-# ────────────── RATE LIMITER ─────────
-limiter = Limiter(key_func=get_remote_address)
 
-# ────────────── FASTAPI APP ─────────
+# ── Application lifecycle ──────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting %s v%s", settings.PROJECT_NAME, settings.VERSION)
+    logger.info("Configuration: %s", json.dumps(settings.summary(), default=str))
+
+    try:
+        create_db_and_tables()
+    except SQLAlchemyError as exc:
+        logger.critical("Database is unavailable, cannot start: %s", exc)
+        raise RuntimeError("Database initialisation failed") from exc
+
+    if not initialize_model():
+        logger.critical(
+            "The risk model could not be loaded from %s. Refusing to start: the service "
+            "would accept vitals it cannot score.",
+            settings.model_file,
+        )
+        raise RuntimeError("Risk model initialisation failed")
+
+    if initialize_llm_service():
+        logger.info("Advice service ready")
+    else:
+        # Deliberately non-fatal — see the module docstring.
+        logger.warning(
+            "Advice service unavailable at start-up; risk scoring and history remain online"
+        )
+
+    logger.info("%s is ready", settings.PROJECT_NAME)
+    yield
+
+    logger.info("Shutting down")
+    dispose_engine()
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
-    description="Afya Jamii AI - Clinical Decision Support System",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
+    description=(
+        "Clinical decision support for maternal health: vitals capture, risk "
+        "scoring, and guidance for Kenyan pregnant and postnatal mothers."
+    ),
+    version=settings.VERSION,
+    lifespan=lifespan,
+    # API documentation is public in development only.
+    docs_url=None if settings.is_production else "/docs",
+    redoc_url=None if settings.is_production else "/redoc",
+    openapi_url=None if settings.is_production else "/openapi.json",
 )
 app.state.limiter = limiter
 
-# ────────────── MIDDLEWARES ─────────
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["*"] if settings.DEBUG else ["127.0.0.1"]
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS or ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# ── Middleware ─────────────────────────────────────────────────────────────
+# Registered outermost-first: request id wraps logging wraps the rest.
+
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):
+    """Give every request an id, echoed back in X-Request-ID."""
+    incoming = request.headers.get("X-Request-ID")
+    request_id = incoming if incoming and len(incoming) <= 64 else uuid.uuid4().hex[:12]
+    token = request_id_var.set(request_id)
+    request.state.request_id = request_id
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    finally:
+        request_id_var.reset(token)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration = (time.perf_counter() - start) * 1000
+        logger.exception(
+            "%s %s failed after %.1fms", request.method, request.url.path, duration
+        )
+        raise
+
+    duration = (time.perf_counter() - start) * 1000
+    client = request.client.host if request.client else "unknown"
+    logger.info(
+        "%s %s -> %d (%.1fms) from %s",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration,
+        client,
+    )
+    response.headers["X-Response-Time"] = f"{duration:.1f}ms"
+    return response
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
-    response.headers.update({
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "X-XSS-Protection": "1; mode=block",
-    })
-    if not settings.DEBUG and getattr(settings, "CSP_DIRECTIVES", None):
-        response.headers["Content-Security-Policy"] = settings.CSP_DIRECTIVES
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+
+    if settings.is_production:
+        response.headers.setdefault("Content-Security-Policy", settings.CSP_DIRECTIVES)
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            f"max-age={settings.HSTS_MAX_AGE}; includeSubDomains",
+        )
     return response
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.time()
-    try:
-        response = await call_next(request)
-    except Exception:
-        logger.exception(f"Unhandled exception {request.method} {request.url.path}")
-        raise
-    duration = time.time() - start
-    logger.info(f"{request.method} {request.url.path} -> {response.status_code} ({duration:.3f}s) from {request.client.host}")
-    return response
 
-# ────────────── EXCEPTION HANDLERS ─────────
+if settings.RATE_LIMIT_ENABLED:
+    # Without this the @limiter.limit decorators are inert.
+    app.add_middleware(SlowAPIMiddleware)
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    # PATCH and DELETE are needed by the account settings endpoints; without
+    # them the browser's preflight fails and those calls never leave the page.
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
+    max_age=600,
+)
+
+
+# ── Error handling ─────────────────────────────────────────────────────────
+
+def _error(request: Request, status_code: int, detail: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail, "request_id": getattr(request.state, "request_id", None)},
+    )
+
+
 @app.exception_handler(RateLimitExceeded)
-def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
-    return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Try again later."})
+async def handle_rate_limit(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+    logger.warning("Rate limit hit on %s", request.url.path)
+    return _error(request, status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests. Please slow down.")
+
+
+@app.exception_handler(RequestValidationError)
+async def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Flatten Pydantic's structure into messages a UI can show directly.
+    problems = [
+        {
+            "field": ".".join(str(part) for part in error["loc"] if part not in ("body", "query")),
+            "message": error["msg"],
+        }
+        for error in exc.errors()
+    ]
+    logger.info("Validation failed on %s: %s", request.url.path, problems)
+    return _error(request, status.HTTP_422_UNPROCESSABLE_ENTITY, problems)
+
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    logger.warning(f"HTTPException for {request.method} {request.url.path}: {exc.detail}")
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+async def handle_http_exception(request: Request, exc: HTTPException) -> JSONResponse:
+    if exc.status_code >= 500:
+        logger.error("%s on %s: %s", exc.status_code, request.url.path, exc.detail)
+    response = _error(request, exc.status_code, exc.detail)
+    if exc.headers:
+        response.headers.update(exc.headers)
+    return response
+
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    logger.exception(f"Unhandled exception for {request.method} {request.url.path}")
-    return JSONResponse(status_code=500, content={"detail": "Internal server error — check server logs for details."})
+async def handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    # The message is deliberately generic; details go to the log, keyed by the
+    # request id the client receives.
+    logger.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return _error(
+        request,
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "Something went wrong on our side. Quote the request id if you contact support.",
+    )
 
-# ────────────── STARTUP ──────────────
-@app.on_event("startup")
-def startup_event():
-    logger.info("Starting Afya Jamii AI startup sequence...")
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _decode_importances(raw: Optional[str]) -> dict[str, float]:
+    """Parse the stored feature-importance JSON, tolerating older rows."""
+    if not raw:
+        return {}
     try:
-        create_db_and_tables()
-        logger.info("Database tables created/verified.")
-    except Exception:
-        logger.exception("Database initialization failed")
-        raise RuntimeError("Database initialization failed")
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("Skipping malformed feature importances")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(k): float(v) for k, v in parsed.items() if isinstance(v, (int, float))}
 
+
+def _describe_vitals(vitals: VitalsInput, account_type: AccountType, prediction) -> str:
+    """Build the context block handed to the language model."""
+    ranked = sorted(prediction.feature_importances.items(), key=lambda item: item[1], reverse=True)
+    top_factors = ", ".join(f"{name} ({value:.0%})" for name, value in ranked[:3]) or "not available"
+
+    return "\n".join(
+        [
+            "The user has just submitted a set of vitals.",
+            "",
+            f"- Age: {vitals.age} years",
+            f"- Blood pressure: {vitals.systolic_bp}/{vitals.diastolic_bp} mmHg",
+            f"- Blood sugar: {vitals.bs} mmol/L",
+            f"- Body temperature: {vitals.body_temp_celsius}°C",
+            f"- Heart rate: {vitals.heart_rate} bpm",
+            f"- Account type: {account_type.value}",
+            f"- Reported history: {vitals.patient_history or 'none given'}",
+            "",
+            f"Risk assessment: {prediction.label} "
+            f"(confidence {prediction.probability:.0%}).",
+            f"Most influential readings: {top_factors}.",
+        ]
+    )
+
+
+def _condense(reply: str, limit: int) -> str:
+    """Shorten a past reply to ``limit`` characters on a word boundary."""
+    reply = reply.strip()
+    if len(reply) <= limit:
+        return reply
+
+    clipped = reply[:limit]
+    boundary = clipped.rfind(" ")
+    if boundary > limit // 2:
+        clipped = clipped[:boundary]
+    return clipped.rstrip() + " […]"
+
+
+def _recent_history(session: Session, user_id: int, turns: int) -> str:
+    """Return recent exchanges, oldest first, within a fixed size budget.
+
+    Two limits apply. Each past reply is condensed to
+    ``CHAT_HISTORY_REPLY_CHARS``, and turns are admitted newest-first until
+    ``CHAT_HISTORY_CHAR_BUDGET`` is spent. Without them the prompt grew with
+    every exchange — replies run to several thousand characters each, so a
+    ten-turn history reached ~40k characters and every question took longer
+    than the one before it.
+
+    The user's own questions are kept in full: they are short, and they carry
+    the thread of the conversation.
+    """
+    if turns <= 0:
+        return ""
+
+    # Take the newest rows, then restore chronological order for the prompt.
+    # (A previous revision ordered ascending and truncated, which fed the model
+    # the user's oldest turns and dropped everything recent.)
+    records = session.exec(
+        select(ConversationHistory)
+        .where(ConversationHistory.user_id == user_id)
+        .order_by(ConversationHistory.created_at.desc())
+        .limit(turns)
+    ).all()
+
+    budget = settings.CHAT_HISTORY_CHAR_BUDGET
+    exchanges: list[str] = []
+
+    for record in records:  # newest first, so the oldest turns drop out
+        exchange = (
+            f"User: {record.user_message}\n"
+            f"Afya Jamii: {_condense(record.ai_response, settings.CHAT_HISTORY_REPLY_CHARS)}"
+        )
+        if len(exchange) > budget:
+            break
+        exchanges.append(exchange)
+        budget -= len(exchange)
+
+    return "\n\n".join(reversed(exchanges))
+
+
+async def _advise(values: dict[str, Any]) -> LLMAdviceResponse:
+    """Ask the model for advice, degrading to a safe message on failure."""
     try:
-        if not initialize_model():
-            raise RuntimeError("initialize_model returned falsy")
-        logger.info("ML model loaded.")
-    except Exception:
-        logger.exception("ML model initialization failed")
-        raise RuntimeError("ML model init failed")
+        advice = await afya_llm.generate_advice(values)
+        return LLMAdviceResponse(advice=advice, timestamp=utcnow(), generated=True)
+    except LLMUnavailableError as exc:
+        logger.warning("Falling back to the offline advice message: %s", exc)
+        return LLMAdviceResponse(advice=UNAVAILABLE_MESSAGE, timestamp=utcnow(), generated=False)
 
-    try:
-        if initialize_llm_service():
-            logger.info("LLM service initialized.")
-        else:
-            logger.warning("LLM initialization returned falsy — running reduced LLM mode")
-    except Exception:
-        logger.exception("LLM initialization raised exception; continuing in limited mode")
-    logger.info("Afya Jamii startup complete.")
 
-# ────────────── HELPERS ──────────────
-def safe_json(obj):
-    """Convert numpy objects to native python types for JSON."""
-    try:
-        return json.loads(json.dumps(obj, default=lambda x: x.tolist() if hasattr(x, "tolist") else str(x)))
-    except Exception:
-        return obj
+# ── System endpoints ───────────────────────────────────────────────────────
 
-# ────────────── ENDPOINTS ──────────────
 @app.get("/", include_in_schema=False)
-async def root():
-    return {"message": "Afya Jamii AI API is running", "status": "healthy"}
+async def root() -> dict[str, str]:
+    return {"service": settings.PROJECT_NAME, "version": settings.VERSION, "status": "ok"}
 
-@app.get("/health")
-@limiter.limit(f"{settings.RATE_LIMIT_PER_MINUTE}/minute")
-async def health_check(request: Request):
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "version": "1.0.0",
-        "services": {
-            "database": "connected",
-            "ml_model": bool(getattr(risk_model, "model", None)),
-            "llm_service": bool(getattr(afya_llm, "llm", None))
-        }
-    }
 
-# ------------ Auth ------------
-@app.post("/api/v1/auth/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-@limiter.limit("10/minute")
-async def signup(request: Request, user_data: UserCreate, session: Session = Depends(get_session)):
+@app.get("/health", response_model=HealthResponse, tags=["system"])
+async def health_check(response: Response) -> HealthResponse:
+    """Report component health.
+
+    Returns 503 when a required component is down, so orchestrators can pull
+    the instance out of rotation.
+    """
+    database_ok = check_connection()
+    model_ok = risk_model.is_loaded
+    llm_status = afya_llm.status()
+
+    if not (database_ok and model_ok):
+        state = "unhealthy"
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    elif not llm_status.ready:
+        # Advice is degraded but the core service still works.
+        state = "degraded"
+    else:
+        state = "healthy"
+
+    return HealthResponse(
+        status=state,
+        timestamp=utcnow(),
+        version=settings.VERSION,
+        environment=settings.ENVIRONMENT.value,
+        services={
+            "database": {"ready": database_ok, "pool": pool_stats()},
+            "risk_model": {"ready": model_ok, "classes": risk_model.classes},
+            "advice": llm_status.as_dict(),
+        },
+    )
+
+
+# ── Authentication ─────────────────────────────────────────────────────────
+
+@app.post(
+    f"{settings.API_V1_STR}/auth/signup",
+    response_model=UserResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["auth"],
+)
+@limiter.limit(settings.RATE_LIMIT_SIGNUP)
+async def signup(
+    request: Request,
+    user_data: UserCreate,
+    session: Session = Depends(get_session),
+) -> UserDB:
     existing = session.exec(
-        select(UserDB).where((UserDB.username == user_data.username) | (UserDB.email == user_data.email))
+        select(UserDB).where(
+            (UserDB.username == user_data.username) | (UserDB.email == user_data.email)
+        )
     ).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Username or email already registered")
+    if existing is not None:
+        field = "username" if existing.username == user_data.username else "email"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"That {field} is already registered",
+        )
 
-    hashed_pw = get_password_hash(user_data.password)
-    db_user = UserDB(**user_data.dict(exclude={"password"}), hashed_password=hashed_pw)
-    session.add(db_user)
+    user = UserDB(
+        **user_data.model_dump(exclude={"password"}),
+        hashed_password=get_password_hash(user_data.password),
+    )
+    session.add(user)
     session.commit()
-    session.refresh(db_user)
-    logger.info("New user created: %s", db_user.username)
-    return db_user
+    session.refresh(user)
 
-@app.post("/api/v1/auth/login", response_model=Token)
-@limiter.limit("5/minute")
-async def login(request: Request, login_data: UserLogin, session: Session = Depends(get_session)):
+    logger.info("Account created: %s (%s)", user.username, user.account_type.value)
+    return user
+
+
+@app.post(f"{settings.API_V1_STR}/auth/login", response_model=Token, tags=["auth"])
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
+async def login(
+    request: Request,
+    login_data: UserLogin,
+    session: Session = Depends(get_session),
+) -> Token:
     user = authenticate_user(session, login_data.username, login_data.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    token = create_access_token(data={"sub": user.username})
-    logger.info("User logged in: %s", user.username)
-    return Token(access_token=token, token_type="bearer",
-                 expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+    if user is None:
+        logger.info("Failed sign-in for %s", login_data.username)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-# ------------ Vitals submission ------------
-@app.post("/api/v1/vitals/submit", response_model=CombinedResponse)
+    logger.info("Signed in: %s", user.username)
+    return Token(
+        access_token=create_access_token(data={"sub": user.username}),
+        token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        username=user.username,
+        account_type=user.account_type,
+    )
+
+
+@app.get(f"{settings.API_V1_STR}/auth/me", response_model=UserResponse, tags=["auth"])
+async def read_current_user(
+    current_user: UserDB = Depends(get_current_active_user),
+) -> UserDB:
+    """Return the signed-in user, so a client can restore a session from a token."""
+    return current_user
+
+
+# ── Account settings ───────────────────────────────────────────────────────
+
+@app.get(f"{settings.API_V1_STR}/users/me", response_model=UserResponse, tags=["settings"])
+async def get_profile(current_user: UserDB = Depends(get_current_active_user)) -> UserDB:
+    """The signed-in user's profile."""
+    return current_user
+
+
+@app.patch(f"{settings.API_V1_STR}/users/me", response_model=UserResponse, tags=["settings"])
+async def update_profile(
+    request: Request,
+    updates: UserUpdate,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> UserDB:
+    """Change the profile fields a user is allowed to edit.
+
+    The username is not editable: it identifies the account and is the subject
+    of every issued token, so changing it would invalidate the caller's own
+    session mid-request.
+    """
+    changes = updates.model_dump(exclude_unset=True)
+
+    if "email" in changes:
+        clash = session.exec(
+            select(UserDB).where(UserDB.email == changes["email"], UserDB.id != current_user.id)
+        ).first()
+        if clash is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="That email is already registered to another account",
+            )
+
+    for field, value in changes.items():
+        setattr(current_user, field, value)
+    current_user.updated_at = utcnow()
+
+    session.add(current_user)
+    session.commit()
+    session.refresh(current_user)
+
+    logger.info("Profile updated for %s: %s", current_user.username, ", ".join(changes))
+    return current_user
+
+
+@app.post(
+    f"{settings.API_V1_STR}/users/me/password",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["settings"],
+)
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
+async def change_password(
+    request: Request,
+    payload: PasswordChange,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    """Set a new password, confirming the current one first.
+
+    Note that existing tokens stay valid until they expire: they are signed
+    with the application secret, not with the password. Revoking them would
+    need a token version or a deny-list, which this service does not yet have.
+    """
+    if not verify_password(payload.current_password, current_user.hashed_password):
+        logger.info("Password change refused for %s: wrong current password", current_user.username)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your current password is not correct",
+        )
+
+    current_user.hashed_password = get_password_hash(payload.new_password)
+    current_user.updated_at = utcnow()
+    session.add(current_user)
+    session.commit()
+
+    logger.info("Password changed for %s", current_user.username)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.post(
+    f"{settings.API_V1_STR}/users/me/deactivate",
+    status_code=status.HTTP_204_NO_CONTENT,
+    tags=["settings"],
+)
+async def deactivate_account(
+    request: Request,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> Response:
+    """Disable the account without destroying anything.
+
+    Offered alongside deletion because it is what most people actually want:
+    sign-in stops working, but the health records survive, so a mother who
+    returns to the service still has her history. Reactivation is a manual
+    operation for an administrator.
+    """
+    current_user.is_active = False
+    current_user.updated_at = utcnow()
+    session.add(current_user)
+    session.commit()
+
+    logger.info("Account deactivated: %s", current_user.username)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@app.delete(
+    f"{settings.API_V1_STR}/users/me",
+    response_model=DeletionSummary,
+    tags=["settings"],
+)
+@limiter.limit(settings.RATE_LIMIT_LOGIN)
+async def delete_account(
+    request: Request,
+    confirmation: AccountDeletion,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> DeletionSummary:
+    """Permanently delete the account and every record attached to it.
+
+    This is irreversible. It requires the account password and the typed
+    phrase 'DELETE MY ACCOUNT', so neither a stolen token alone nor a
+    mis-click is enough to destroy someone's health history.
+
+    Rows are removed child-first — conversations, then vitals, then the user —
+    because both child tables carry a foreign key to users, and conversations
+    additionally reference vitals. The whole thing runs in one transaction: a
+    failure part-way through leaves the account intact rather than orphaned.
+    """
+    if not verify_password(confirmation.password, current_user.hashed_password):
+        logger.warning("Account deletion refused for %s: wrong password", current_user.username)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your password is not correct",
+        )
+
+    username = current_user.username
+    user_id = current_user.id
+
+    try:
+        conversations = session.exec(
+            select(ConversationHistory).where(ConversationHistory.user_id == user_id)
+        ).all()
+        for conversation in conversations:
+            session.delete(conversation)
+
+        vitals = session.exec(
+            select(VitalsRecord).where(VitalsRecord.user_id == user_id)
+        ).all()
+        for record in vitals:
+            session.delete(record)
+
+        # Flush the children before removing the parent so a foreign-key
+        # violation surfaces here rather than at commit.
+        session.flush()
+        session.delete(current_user)
+        session.commit()
+    except SQLAlchemyError:
+        session.rollback()
+        logger.exception("Account deletion failed for %s; nothing was removed", username)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Could not delete the account. Nothing was removed — please try again.",
+        ) from None
+
+    logger.info(
+        "Account deleted: %s (%d vitals records, %d conversations)",
+        username,
+        len(vitals),
+        len(conversations),
+    )
+
+    return DeletionSummary(
+        detail="Your account and all associated health records have been permanently deleted.",
+        username=username,
+        vitals_records_deleted=len(vitals),
+        conversations_deleted=len(conversations),
+        deleted_at=utcnow(),
+    )
+
+
+# ── Vitals ─────────────────────────────────────────────────────────────────
+
+@app.post(
+    f"{settings.API_V1_STR}/vitals/submit",
+    response_model=CombinedResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["vitals"],
+)
+@limiter.limit(settings.RATE_LIMIT_INFERENCE)
 async def submit_vitals(
     request: Request,
     submission: VitalsSubmission,
-    background_tasks: BackgroundTasks,
     current_user: UserDB = Depends(get_current_active_user),
-    session: Session = Depends(get_session)
-):
+    session: Session = Depends(get_session),
+) -> CombinedResponse:
+    """Score a set of vitals and return guidance alongside the result."""
+    vitals = submission.vitals
+    account_type = submission.account_type or current_user.account_type
+
     features = {
-        "Age": submission.vitals.age,
-        "SystolicBP": submission.vitals.systolic_bp,
-        "DiastolicBP": submission.vitals.diastolic_bp,
-        "BS": submission.vitals.bs,
-        "BodyTemp": submission.vitals.body_temp,
-        "HeartRate": submission.vitals.heart_rate,
+        "Age": vitals.age,
+        "SystolicBP": vitals.systolic_bp,
+        "DiastolicBP": vitals.diastolic_bp,
+        "BS": vitals.bs,
+        # The model was trained in Celsius; convert before scoring.
+        "BodyTemp": vitals.body_temp_celsius,
+        "HeartRate": vitals.heart_rate,
     }
 
     try:
-        risk_label, prob, feat_imp = risk_model.predict(features)
+        prediction = risk_model.predict(features)
+    except InvalidFeaturesError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    except ModelNotLoadedError as exc:
+        logger.error("Scoring attempted while the model is unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Risk assessment is temporarily unavailable. Please try again shortly.",
+        ) from exc
 
-        vitals_record = VitalsRecord(
-            user_id=current_user.id,
-            **submission.vitals.dict(),
-            ml_risk_label=str(risk_label),
-            ml_probability=float(prob),
-            ml_feature_importances=json.dumps(safe_json(feat_imp))
-        )
-        session.add(vitals_record)
-        session.commit()
-        session.refresh(vitals_record)
+    record = VitalsRecord(
+        user_id=current_user.id,
+        age=vitals.age,
+        systolic_bp=vitals.systolic_bp,
+        diastolic_bp=vitals.diastolic_bp,
+        bs=vitals.bs,
+        body_temp=vitals.body_temp,
+        body_temp_unit=vitals.body_temp_unit.value,
+        heart_rate=vitals.heart_rate,
+        patient_history=vitals.patient_history,
+        ml_risk_label=prediction.label,
+        ml_probability=prediction.probability,
+        ml_feature_importances=json.dumps(prediction.feature_importances),
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
 
-        ml_output = MLModelOutput(
-            risk_label=str(risk_label),
-            probability=float(prob),
-            feature_importances=safe_json(feat_imp)
-        )
+    logger.info(
+        "Vitals %d scored for %s: %s (%.0f%%)",
+        record.id,
+        current_user.username,
+        prediction.label,
+        prediction.probability * 100,
+    )
 
-        context = f"""The user has just submitted their vitals.
-Patient Data:
-- Age: {submission.vitals.age} years
-- Blood Pressure: {submission.vitals.systolic_bp}/{submission.vitals.diastolic_bp} mmHg
-- Blood Sugar: {submission.vitals.bs} mmol/L
-- Body Temperature: {submission.vitals.body_temp}°{submission.vitals.body_temp_unit}
-- Heart Rate: {submission.vitals.heart_rate} bpm
-- Account Type: {submission.account_type.value}
-- Model Prediction: {str(risk_label)} (Probability: {float(prob):.2f})
-- Feature Importances: {safe_json(feat_imp)}
-- Patient History: {submission.vitals.patient_history or "No history"}
-"""
-        llm_prompt_data = {
-            "context": context,
-            "history": "", # No history on the first turn
-            "question": "Provide initial risk assessment and recommendations based on the vitals data."
+    advice = await _advise(
+        {
+            "context": _describe_vitals(vitals, account_type, prediction),
+            "history": _recent_history(session, current_user.id, settings.CHAT_HISTORY_TURNS),
+            "question": (
+                "Give an initial risk assessment and practical recommendations "
+                "based on these vitals."
+            ),
         }
+    )
 
-        try:
-            advice = afya_llm.generate_advice(llm_prompt_data)
-        except Exception:
-            logger.exception("LLM generate_advice failed - continuing without LLM")
-            advice = "LLM currently unavailable; please consult a clinician."
-
-        llm_advice = LLMAdviceResponse(advice=advice, timestamp=datetime.utcnow())
-
-        convo = ConversationHistory(
-            user_id=current_user.id,
-            vitals_record_id=vitals_record.id,
-            user_message="Initial assessment request",
-            ai_response=advice
+    # Only record exchanges that carry real advice, so a failed call does not
+    # poison the history replayed to the model on the next turn.
+    if advice.generated:
+        session.add(
+            ConversationHistory(
+                user_id=current_user.id,
+                vitals_record_id=record.id,
+                user_message="Initial assessment of submitted vitals",
+                ai_response=advice.advice,
+            )
         )
-        session.add(convo)
         session.commit()
 
-        return CombinedResponse(
-            user_id=current_user.id,
-            submission_id=vitals_record.id,
-            timestamp=datetime.utcnow(),
-            ml_output=ml_output,
-            llm_advice=llm_advice
-        )
-    except Exception:
-        logger.exception("Vitals submission failed")
-        raise HTTPException(status_code=500, detail="Vitals submission failed - see server logs")
+    return CombinedResponse(
+        user_id=current_user.id,
+        submission_id=record.id,
+        timestamp=utcnow(),
+        ml_output=MLModelOutput(
+            risk_label=prediction.label,
+            probability=prediction.probability,
+            class_probabilities=prediction.class_probabilities,
+            feature_importances=prediction.feature_importances,
+        ),
+        llm_advice=advice,
+    )
 
-# ------------ LLM Chat Endpoint ------------
-@app.post("/api/v1/chat/advice", response_model=LLMAdviceResponse)
-async def get_llm_advice(
+
+# ── Chat ───────────────────────────────────────────────────────────────────
+
+@app.post(
+    f"{settings.API_V1_STR}/chat/advice",
+    response_model=LLMAdviceResponse,
+    tags=["chat"],
+)
+@limiter.limit(settings.RATE_LIMIT_INFERENCE)
+async def get_advice(
     request: Request,
     advice_request: LLMAdviceRequest,
     current_user: UserDB = Depends(get_current_active_user),
-    session: Session = Depends(get_session)
-):
-    """Let user ask follow-up questions."""
-    # Fetch conversation history
-    history_records = session.exec(
-        select(ConversationHistory)
-        .where(ConversationHistory.user_id == current_user.id)
-        .order_by(ConversationHistory.created_at.asc())
-    ).all()
-
-    # Format history for the prompt
-    history = "\n".join(
-        [f"User: {rec.user_message}\nAI: {rec.ai_response}" for rec in history_records]
-    )
-
-    llm_prompt_data = {
-        "context": "The user is asking a follow-up question.",
-        "history": history,
-        "question": advice_request.question
-    }
-
-    try:
-        advice = afya_llm.generate_advice(llm_prompt_data)
-    except Exception:
-        logger.exception("LLM advice retrieval failed - continuing without LLM")
-        advice = "LLM currently unavailable; please consult a clinician."
-
-    # Get the latest vitals record to associate the conversation
+    session: Session = Depends(get_session),
+) -> LLMAdviceResponse:
+    """Answer a follow-up question in the context of the user's history."""
     latest_vitals = session.exec(
-        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
-        .order_by(VitalsRecord.created_at.desc()).limit(1)
+        select(VitalsRecord)
+        .where(VitalsRecord.user_id == current_user.id)
+        .order_by(VitalsRecord.created_at.desc())
+        .limit(1)
     ).first()
 
-    convo = ConversationHistory(
-        user_id=current_user.id,
-        vitals_record_id=latest_vitals.id if latest_vitals else None,
-        user_message=advice_request.question,
-        ai_response=advice
+    if latest_vitals is not None:
+        context = (
+            f"The user is asking a follow-up question. Their most recent assessment "
+            f"({latest_vitals.created_at:%d %B %Y}) was {latest_vitals.ml_risk_label}, "
+            f"from a blood pressure of {latest_vitals.systolic_bp}/{latest_vitals.diastolic_bp} mmHg, "
+            f"blood sugar {latest_vitals.bs} mmol/L, and heart rate {latest_vitals.heart_rate} bpm."
+        )
+    else:
+        context = (
+            "The user is asking a question and has not submitted any vitals yet. "
+            f"Their account type is {current_user.account_type.value}."
+        )
+
+    advice = await _advise(
+        {
+            "context": context,
+            "history": _recent_history(session, current_user.id, settings.CHAT_HISTORY_TURNS),
+            "question": advice_request.question,
+        }
     )
-    session.add(convo)
-    session.commit()
 
-    return LLMAdviceResponse(advice=advice, timestamp=datetime.utcnow())
+    if advice.generated:
+        session.add(
+            ConversationHistory(
+                user_id=current_user.id,
+                vitals_record_id=latest_vitals.id if latest_vitals else None,
+                user_message=advice_request.question,
+                ai_response=advice.advice,
+            )
+        )
+        session.commit()
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=UNAVAILABLE_MESSAGE,
+        )
 
-# ------------ History ------------
-@app.get("/api/v1/history/vitals", response_model=List[VitalsRecord])
-async def get_vitals_history(request: Request, limit: int = 10,
-                             current_user: UserDB = Depends(get_current_active_user),
-                             session: Session = Depends(get_session)):
+    return advice
+
+
+# ── History ────────────────────────────────────────────────────────────────
+
+@app.get(
+    f"{settings.API_V1_STR}/history/vitals",
+    response_model=list[VitalsRecordResponse],
+    tags=["history"],
+)
+async def get_vitals_history(
+    request: Request,
+    limit: int = 10,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> list[VitalsRecordResponse]:
+    limit = max(1, min(limit, 100))
     records = session.exec(
-        select(VitalsRecord).where(VitalsRecord.user_id == current_user.id)
-        .order_by(VitalsRecord.created_at.desc()).limit(limit)
+        select(VitalsRecord)
+        .where(VitalsRecord.user_id == current_user.id)
+        .order_by(VitalsRecord.created_at.desc())
+        .limit(limit)
     ).all()
-    return records
 
-@app.get("/api/v1/history/conversations", response_model=List[ConversationHistory])
-async def get_conversation_history(request: Request, limit: int = 20,
-                                   current_user: UserDB = Depends(get_current_active_user),
-                                   session: Session = Depends(get_session)):
-    convos = session.exec(
-        select(ConversationHistory).where(ConversationHistory.user_id == current_user.id)
-        .order_by(ConversationHistory.created_at.desc()).limit(limit)
+    return [
+        VitalsRecordResponse(
+            id=record.id,
+            user_id=record.user_id,
+            age=record.age,
+            systolic_bp=record.systolic_bp,
+            diastolic_bp=record.diastolic_bp,
+            bs=record.bs,
+            body_temp=record.body_temp,
+            body_temp_unit=record.body_temp_unit,
+            heart_rate=record.heart_rate,
+            patient_history=record.patient_history,
+            ml_risk_label=record.ml_risk_label,
+            ml_probability=record.ml_probability,
+            ml_feature_importances=_decode_importances(record.ml_feature_importances),
+            created_at=record.created_at,
+        )
+        for record in records
+    ]
+
+
+@app.get(
+    f"{settings.API_V1_STR}/history/conversations",
+    response_model=list[ConversationResponse],
+    tags=["history"],
+)
+async def get_conversation_history(
+    request: Request,
+    limit: int = 20,
+    current_user: UserDB = Depends(get_current_active_user),
+    session: Session = Depends(get_session),
+) -> list[ConversationHistory]:
+    limit = max(1, min(limit, 100))
+    return session.exec(
+        select(ConversationHistory)
+        .where(ConversationHistory.user_id == current_user.id)
+        .order_by(ConversationHistory.created_at.desc())
+        .limit(limit)
     ).all()
-    return convos
+
+
+if __name__ == "__main__":  # pragma: no cover
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.RELOAD,
+        log_config=None,  # configure_logging() already installed handlers
+    )

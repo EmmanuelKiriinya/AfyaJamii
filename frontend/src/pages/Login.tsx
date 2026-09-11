@@ -1,26 +1,27 @@
-import { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { useToast } from '@/hooks/use-toast';
-import { useAuth } from '@/contexts/AuthContext';
-import { api } from '@/lib/api';
-import logo from '@/assets/logo.png';
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { IconSpinner } from "@/components/Icon";
+import { BrandLink } from "@/components/BrandLink";
+import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/contexts/AuthContext";
+import { api, ApiError } from "@/lib/api";
 
 const Login = () => {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
-  const { login } = useAuth();
+  const { signIn } = useAuth();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
-    if (!username || !password) {
+
+    if (!username.trim() || !password) {
       toast({
         title: "Error",
         description: "Please fill in all fields",
@@ -31,18 +32,19 @@ const Login = () => {
 
     setIsLoading(true);
     try {
-      const response = await api.login({ username, password });
-      // Store a default account type for now - this should ideally come from the login response
-      login(response.token, username, 'general');
+      const session = await api.login({ username: username.trim(), password });
+      // The account type comes from the server, so the dashboard shows the
+      // right guidance instead of assuming "general".
+      signIn(session);
       toast({
         title: "Success",
         description: "Logged in successfully",
       });
-      navigate('/dashboard');
+      navigate("/dashboard", { replace: true });
     } catch (error) {
       toast({
         title: "Login Failed",
-        description: error instanceof Error ? error.message : "Invalid credentials",
+        description: error instanceof ApiError ? error.message : "Invalid credentials",
         variant: "destructive",
       });
     } finally {
@@ -55,20 +57,24 @@ const Login = () => {
       <Card className="w-full max-w-md shadow-2xl border-2 border-primary/10">
         <CardHeader className="space-y-4 text-center pb-8">
           <div className="flex justify-center">
-            <img src={logo} alt="AfyaJamii Logo" className="h-24 w-24" />
+            <BrandLink size={96} showName={false} />
           </div>
           <div>
             <CardTitle className="text-3xl font-bold">Welcome Back</CardTitle>
-            <CardDescription className="text-base mt-2">Sign in to your AfyaJamii account to continue your health journey</CardDescription>
+            <CardDescription className="text-base mt-2">
+              Sign in to your AfyaJamii account to continue your health journey
+            </CardDescription>
           </div>
         </CardHeader>
         <CardContent className="pb-8">
-          <form onSubmit={handleSubmit} className="space-y-5">
+          <form onSubmit={handleSubmit} className="space-y-5" noValidate>
             <div className="space-y-2">
               <Label htmlFor="username" className="text-sm font-medium">Username</Label>
               <Input
                 id="username"
                 type="text"
+                autoComplete="username"
+                autoCapitalize="none"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
                 placeholder="Enter your username"
@@ -81,6 +87,7 @@ const Login = () => {
               <Input
                 id="password"
                 type="password"
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 placeholder="Enter your password"
@@ -89,11 +96,18 @@ const Login = () => {
               />
             </div>
             <Button type="submit" className="w-full h-11 text-base font-medium" disabled={isLoading}>
-              {isLoading ? "Signing in..." : "Sign In"}
+              {isLoading ? (
+                <>
+                  <IconSpinner size={16} className="mr-2" />
+                  Signing in...
+                </>
+              ) : (
+                "Sign In"
+              )}
             </Button>
           </form>
           <div className="mt-6 text-center text-sm">
-            Don't have an account?{' '}
+            Don&rsquo;t have an account?{" "}
             <Link to="/signup" className="text-primary hover:underline font-semibold">
               Sign up for free
             </Link>

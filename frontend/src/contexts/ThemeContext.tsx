@@ -1,70 +1,72 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 
-type Theme = 'light' | 'dark' | 'system';
+type Theme = "light" | "dark" | "system";
 
-interface ThemeContextType {
+interface ThemeContextValue {
   theme: Theme;
+  /** What "system" currently resolves to. */
+  resolvedTheme: "light" | "dark";
   setTheme: (theme: Theme) => void;
-  actualTheme: 'light' | 'dark';
 }
 
-const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
+const STORAGE_KEY = "afyajamii.theme";
 
-export const ThemeProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [theme, setTheme] = useState<Theme>(() => {
-    const stored = localStorage.getItem('afyajamii_theme') as Theme;
-    return stored || 'system';
-  });
+const ThemeContext = createContext<ThemeContextValue | undefined>(undefined);
 
-  const [actualTheme, setActualTheme] = useState<'light' | 'dark'>('light');
+function readStoredTheme(): Theme {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored === "light" || stored === "dark" || stored === "system") return stored;
+  } catch {
+    // Storage unavailable — fall through to the default.
+  }
+  return "system";
+}
+
+export function ThemeProvider({ children }: { children: React.ReactNode }) {
+  const [theme, setThemeState] = useState<Theme>(readStoredTheme);
+  const [resolvedTheme, setResolvedTheme] = useState<"light" | "dark">("light");
 
   useEffect(() => {
-    const root = document.documentElement;
-    
-    const applyTheme = (isDark: boolean) => {
-      if (isDark) {
-        root.classList.add('dark');
-        setActualTheme('dark');
-      } else {
-        root.classList.remove('dark');
-        setActualTheme('light');
-      }
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+
+    const apply = (isDark: boolean) => {
+      document.documentElement.classList.toggle("dark", isDark);
+      // Tells the browser which scrollbar and form-control palette to use.
+      document.documentElement.style.colorScheme = isDark ? "dark" : "light";
+      setResolvedTheme(isDark ? "dark" : "light");
     };
 
-    if (theme === 'system') {
-      // Detect system preference
-      const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
-      applyTheme(mediaQuery.matches);
-
-      // Listen for system theme changes
-      const handleChange = (e: MediaQueryListEvent) => {
-        applyTheme(e.matches);
-      };
-
-      mediaQuery.addEventListener('change', handleChange);
-      return () => mediaQuery.removeEventListener('change', handleChange);
-    } else {
-      // Apply manual theme
-      applyTheme(theme === 'dark');
+    if (theme !== "system") {
+      apply(theme === "dark");
+      return;
     }
+
+    apply(media.matches);
+    const onChange = (event: MediaQueryListEvent) => apply(event.matches);
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
   }, [theme]);
 
-  const handleSetTheme = (newTheme: Theme) => {
-    setTheme(newTheme);
-    localStorage.setItem('afyajamii_theme', newTheme);
-  };
+  const setTheme = useCallback((next: Theme) => {
+    setThemeState(next);
+    try {
+      localStorage.setItem(STORAGE_KEY, next);
+    } catch {
+      // Preference simply won't persist.
+    }
+  }, []);
 
-  return (
-    <ThemeContext.Provider value={{ theme, setTheme: handleSetTheme, actualTheme }}>
-      {children}
-    </ThemeContext.Provider>
-  );
-};
+  const value = useMemo(() => ({ theme, resolvedTheme, setTheme }), [theme, resolvedTheme, setTheme]);
 
-export const useTheme = () => {
+  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function useTheme() {
   const context = useContext(ThemeContext);
   if (context === undefined) {
-    throw new Error('useTheme must be used within a ThemeProvider');
+    throw new Error("useTheme must be used within a ThemeProvider");
   }
   return context;
-};
+}

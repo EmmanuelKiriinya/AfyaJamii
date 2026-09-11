@@ -2,25 +2,41 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/logo.png" />
-    <link rel="apple-touch-icon" href="/logo.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AfyaJamii - AI-Powered Maternal Health Platform</title>
-    <meta name="description" content="AI-powered maternal health and nutrition platform providing personalized health monitoring, risk assessment, and expert guidance for pregnancy and postnatal care" />
-    <meta name="author" content="AfyaJamii" />
 
-    <meta property="og:title" content="AfyaJamii - Maternal Health & Nutrition Platform" />
-    <meta property="og:description" content="Your trusted AI companion for pregnancy and postnatal care with health monitoring and expert guidance" />
+    <title>Afya Jamii — Maternal health support for mothers in Kenya</title>
+    <meta
+      name="description"
+      content="Record your vitals, understand what they mean, and get maternal health and nutrition guidance grounded in Kenyan clinical practice."
+    />
+
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+
+    <!-- Matches the light and dark grounds in index.css, so the browser chrome
+         does not flash a mismatched colour before the stylesheet loads. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f1e6" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1f1b18" />
+
     <meta property="og:type" content="website" />
-    <meta property="og:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+    <meta property="og:title" content="Afya Jamii — Maternal health support" />
+    <meta
+      property="og:description"
+      content="Maternal health monitoring and guidance for mothers in Kenya. Built to support the care you receive from a health worker, not to replace it."
+    />
+    <meta property="og:image" content="/logo.png" />
+    <meta name="twitter:card" content="summary" />
 
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:site" content="@lovable_dev" />
-    <meta name="twitter:image" content="https://lovable.dev/opengraph-image-p98pqg.png" />
+    <!-- Warm the font connection before the stylesheet requests the files. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   </head>
 
   <body>
     <div id="root"></div>
+    <noscript>
+      Afya Jamii needs JavaScript to run. Please enable it in your browser settings.
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

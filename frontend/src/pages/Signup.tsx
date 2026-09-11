@@ -1,34 +1,40 @@
-import { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { useToast } from '@/hooks/use-toast';
-import { useAuth } from '@/contexts/AuthContext';
-import { api } from '@/lib/api';
-import logo from '@/assets/logo.png';
+import { useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { IconSpinner } from "@/components/Icon";
+import { BrandLink } from "@/components/BrandLink";
+import { useToast } from "@/hooks/use-toast";
+import { useAuth } from "@/contexts/AuthContext";
+import { api, ApiError, type AccountType } from "@/lib/api";
 
 const Signup = () => {
   const [formData, setFormData] = useState({
-    username: '',
-    email: '',
-    full_name: '',
-    password: '',
-    confirmPassword: '',
-    account_type: '' as 'pregnant' | 'postnatal' | 'general' | '',
+    username: "",
+    email: "",
+    full_name: "",
+    password: "",
+    confirmPassword: "",
+    account_type: "" as AccountType | "",
   });
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
-  const { login } = useAuth();
+  const { signIn } = useAuth();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!formData.username || !formData.email || !formData.full_name || 
-        !formData.password || !formData.account_type) {
+    if (
+      !formData.username.trim() ||
+      !formData.email.trim() ||
+      !formData.full_name.trim() ||
+      !formData.password ||
+      !formData.account_type
+    ) {
       toast({
         title: "Error",
         description: "Please fill in all fields",
@@ -46,6 +52,16 @@ const Signup = () => {
       return;
     }
 
+    // Mirrors the backend rule, so the failure is caught before a round trip.
+    if (/^\d+$/.test(formData.password) || /^[a-zA-Z]+$/.test(formData.password)) {
+      toast({
+        title: "Error",
+        description: "Password must mix letters with numbers or symbols",
+        variant: "destructive",
+      });
+      return;
+    }
+
     if (formData.password !== formData.confirmPassword) {
       toast({
         title: "Error",
@@ -58,26 +74,29 @@ const Signup = () => {
     setIsLoading(true);
     try {
       await api.signup({
-        username: formData.username,
-        email: formData.email,
-        full_name: formData.full_name,
+        username: formData.username.trim(),
+        email: formData.email.trim(),
+        full_name: formData.full_name.trim(),
         password: formData.password,
-        account_type: formData.account_type as 'pregnant' | 'postnatal' | 'general',
+        account_type: formData.account_type as AccountType,
       });
-      
+
       // Auto-login after signup
-      const loginResponse = await api.login({ username: formData.username, password: formData.password });
-      login(loginResponse.token, formData.username, formData.account_type);
-      
+      const session = await api.login({
+        username: formData.username.trim(),
+        password: formData.password,
+      });
+      signIn(session);
+
       toast({
         title: "Success",
         description: "Account created successfully!",
       });
-      navigate('/dashboard');
+      navigate("/dashboard", { replace: true });
     } catch (error) {
       toast({
         title: "Signup Failed",
-        description: error instanceof Error ? error.message : "Failed to create account",
+        description: error instanceof ApiError ? error.message : "Failed to create account",
         variant: "destructive",
       });
     } finally {
@@ -90,22 +109,24 @@ const Signup = () => {
       <Card className="w-full max-w-md shadow-2xl border-2 border-primary/10">
         <CardHeader className="space-y-4 text-center pb-6">
           <div className="flex justify-center">
-            <div className="relative">
-              <img src={logo} alt="AfyaJamii Logo" className="h-20 w-20" />
-            </div>
+            <BrandLink size={80} showName={false} />
           </div>
           <div>
             <CardTitle className="text-3xl font-bold">Create Account</CardTitle>
-            <CardDescription className="text-base mt-2">Join AfyaJamii for personalized maternal health support</CardDescription>
+            <CardDescription className="text-base mt-2">
+              Join AfyaJamii for personalised maternal health support
+            </CardDescription>
           </div>
         </CardHeader>
         <CardContent className="pb-8">
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
             <div className="space-y-2">
               <Label htmlFor="username" className="text-sm font-medium">Username</Label>
               <Input
                 id="username"
                 type="text"
+                autoComplete="username"
+                autoCapitalize="none"
                 value={formData.username}
                 onChange={(e) => setFormData({ ...formData, username: e.target.value })}
                 placeholder="Choose a username"
@@ -118,6 +139,8 @@ const Signup = () => {
               <Input
                 id="email"
                 type="email"
+                autoComplete="email"
+                autoCapitalize="none"
                 value={formData.email}
                 onChange={(e) => setFormData({ ...formData, email: e.target.value })}
                 placeholder="your@email.com"
@@ -130,6 +153,7 @@ const Signup = () => {
               <Input
                 id="full_name"
                 type="text"
+                autoComplete="name"
                 value={formData.full_name}
                 onChange={(e) => setFormData({ ...formData, full_name: e.target.value })}
                 placeholder="Enter your full name"
@@ -141,25 +165,30 @@ const Signup = () => {
               <Label htmlFor="account_type" className="text-sm font-medium">Account Type</Label>
               <Select
                 value={formData.account_type}
-                onValueChange={(value) => setFormData({ ...formData, account_type: value as any })}
+                onValueChange={(value) =>
+                  setFormData({ ...formData, account_type: value as AccountType })
+                }
                 disabled={isLoading}
               >
-                <SelectTrigger className="h-11">
+                <SelectTrigger className="h-11" id="account_type">
                   <SelectValue placeholder="Select your account type" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="pregnant">🤰 Pregnant</SelectItem>
-                  <SelectItem value="postnatal">👶 Postnatal</SelectItem>
-                  <SelectItem value="general">💚 General Health</SelectItem>
+                  <SelectItem value="pregnant">Pregnant</SelectItem>
+                  <SelectItem value="postnatal">Postnatal</SelectItem>
+                  <SelectItem value="general">General Health</SelectItem>
                 </SelectContent>
               </Select>
-              <p className="text-xs text-muted-foreground">Choose the option that best describes your current situation</p>
+              <p className="text-xs text-muted-foreground">
+                Choose the option that best describes your current situation
+              </p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="password" className="text-sm font-medium">Password</Label>
               <Input
                 id="password"
                 type="password"
+                autoComplete="new-password"
                 value={formData.password}
                 onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                 placeholder="At least 8 characters"
@@ -172,6 +201,7 @@ const Signup = () => {
               <Input
                 id="confirmPassword"
                 type="password"
+                autoComplete="new-password"
                 value={formData.confirmPassword}
                 onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
                 placeholder="Re-enter your password"
@@ -179,12 +209,23 @@ const Signup = () => {
                 className="h-11"
               />
             </div>
-            <Button type="submit" className="w-full h-11 text-base font-medium mt-6" disabled={isLoading}>
-              {isLoading ? "Creating account..." : "Create Account"}
+            <Button
+              type="submit"
+              className="w-full h-11 text-base font-medium mt-6"
+              disabled={isLoading}
+            >
+              {isLoading ? (
+                <>
+                  <IconSpinner size={16} className="mr-2" />
+                  Creating account...
+                </>
+              ) : (
+                "Create Account"
+              )}
             </Button>
           </form>
           <div className="mt-6 text-center text-sm">
-            Already have an account?{' '}
+            Already have an account?{" "}
             <Link to="/login" className="text-primary hover:underline font-semibold">
               Sign in
             </Link>

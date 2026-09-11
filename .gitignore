@@ -164,13 +164,17 @@ cython_debug/
 *.code-workspace
 
 # Data files and ML models
+#
+# Note: `*.json` was previously ignored here to keep datasets out of the repo,
+# but it also silently excluded package.json, tsconfig.json, components.json
+# and the prompt templates, leaving the frontend unbuildable from a fresh
+# clone. The rule is now scoped to data directories only.
 *.csv
-*.json
 *.joblib
 *.h5
 *.model
-# /data/
-# !/data/README.md
+**/data/*.json
+**/datasets/*.json
 
 # ML model files (large binary files - DO NOT COMMIT)
 /models/
@@ -321,3 +325,6 @@ dist-ssr
 *.sw?
 *.vercel
 !lib/
+# Test database artifact
+.pytest_afya.db
+afya_jamii_dev.db

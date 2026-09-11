@@ -1,0 +1,73 @@
+[project]
+name = "afya-jamii-api"
+version = "1.0.0"
+description = "Maternal health monitoring and guidance API for mothers in Kenya."
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+# Kept in step with requirements.txt. That file remains the source of truth for
+# a plain pip install; this block exists because FastAPI Cloud reads the
+# project's dependencies from pyproject.toml.
+dependencies = [
+    # Web framework
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "gunicorn>=22.0.0",
+    "python-multipart>=0.0.9",
+    "slowapi>=0.1.9",
+
+    # Configuration
+    "pydantic>=2.9.2",
+    "pydantic-settings>=2.3.4",
+    "python-dotenv>=1.0.1",
+    "email-validator>=2.2.0",
+
+    # Persistence
+    "sqlmodel>=0.0.22",
+    "SQLAlchemy>=2.0.34",
+    "PyMySQL>=1.1.1",
+    "cryptography>=46.0.1",
+
+    # Authentication.
+    # bcrypt is pinned below 4.1: passlib 1.7.4 reads bcrypt.__about__, which
+    # was removed in 4.1, and every hash then logs a spurious version error.
+    "passlib>=1.7.4",
+    "bcrypt>=4.0.1,<4.1",
+    "python-jose>=3.3.0",
+
+    # Machine learning.
+    # scikit-learn is held at 1.6.x to match the version the bundled label
+    # encoder was pickled with; a mismatch only warns, but the warning is
+    # noise and the guarantee is worth keeping.
+    "xgboost>=3.0.0",
+    "scikit-learn>=1.6.1,<1.7",
+    "numpy>=1.26.4,<2",
+    "joblib>=1.4.2",
+
+    # Language model
+    "langchain-core>=0.2.43",
+    "langchain-groq>=0.1.10",
+    "groq>=0.32.0",
+
+    # Observability
+    "structlog>=24.2.0",
+    "sentry-sdk>=2.17.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# The importable package, plus the model artefacts it loads at start-up.
+packages = ["app"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"data" = "data"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

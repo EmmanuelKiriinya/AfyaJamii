@@ -1,227 +1,196 @@
-import os
+"""Database engine, sessions, and schema management.
+
+The engine is created once at import time and shared by every request through
+the :func:`get_session` dependency. Connection settings come from the
+environment; see ``app.config``.
+"""
+
+from __future__ import annotations
+
 import logging
 from contextlib import contextmanager
-from sqlmodel import SQLModel, create_engine, Session
-from sqlalchemy.pool import QueuePool
-from sqlalchemy import text
+from pathlib import Path
+from typing import Any, Iterator
 
-# Load settings
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.pool import QueuePool
+from sqlmodel import Session, SQLModel, create_engine
+
 from app.config import settings
 
-# ───────────────────────────
-# LOGGER
-# ───────────────────────────
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-# Debug DB URL/port
-print(f"Effective DATABASE_URL: {settings.DATABASE_URL}")
-print(f"Effective DATABASE_PORT: {settings.DATABASE_PORT}")
-
-# ───────────────────────────
-# ENGINE (MySQL + pooling)
-# ───────────────────────────
-engine = create_engine(
-    settings.DATABASE_URL,
-    poolclass=QueuePool,
-    pool_size=settings.DB_POOL_SIZE,
-    max_overflow=settings.DB_MAX_OVERFLOW,
-    pool_recycle=settings.DB_POOL_RECYCLE,
-    echo=settings.DB_ECHO,
-    connect_args={
-        "charset": "utf8mb4",
-        "autocommit": False,  # let SQLAlchemy manage transactions
-    },
+# Columns that must hold more than MySQL's default TEXT capacity. Model advice
+# and feature-importance documents routinely exceed 64 KB.
+LONGTEXT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("conversation_history", "ai_response"),
+    ("vitals_records", "ml_feature_importances"),
 )
 
-# ───────────────────────────
-# CREATE DB + TABLES
-# ───────────────────────────
-def create_db_and_tables():
-    """Create all tables and ensure key text columns are LONGTEXT (MySQL)."""
-    try:
-        SQLModel.metadata.create_all(engine)
-        logger.info("Database tables created successfully.")
-    except Exception as e:
-        logger.error(f"Error creating database tables: {e}")
-        raise
+_is_mysql = settings.DATABASE_URL.startswith("mysql")
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 
-    # Ensure large text columns are LONGTEXT (MySQL)
-    try:
-        if settings.DATABASE_URL.startswith("mysql"):
-            with engine.connect() as conn:
-                for table, column in [
-                    ("conversation_history", "ai_response"),
-                    ("vitals_records", "ml_feature_importances"),
-                ]:
-                    logger.info(f"Ensuring {table}.{column} is LONGTEXT")
-                    conn.execute(text(f"ALTER TABLE {table} MODIFY {column} LONGTEXT"))
-                conn.commit()
-    except Exception as e:
-        logger.warning(f"Could not alter columns to LONGTEXT: {e}")
+def _mysql_ssl_context() -> Any:
+    """Build the TLS context for the MySQL connection.
 
-# ───────────────────────────
-# SESSION HANDLERS
-# ───────────────────────────
-def get_session():
-    """FastAPI dependency to get DB session."""
+    Returns None when TLS is disabled. A managed database reached over the
+    public internet accepts unencrypted connections unless the client asks for
+    TLS, so leaving this unset would quietly send patient vitals in plaintext —
+    hence `require` rather than `disable` as the default in ``app.config``.
+
+    `verify` additionally checks the server certificate, which needs the
+    provider's CA in DB_SSL_CA. Aiven and several others sign with a private
+    CA that the system trust store does not know, so verification fails with
+    CERTIFICATE_VERIFY_FAILED until that file is supplied.
+    """
+    import ssl
+
+    mode = settings.DB_SSL_MODE
+    if mode == "disable":
+        logger.warning(
+            "Database TLS is disabled. Only do this for a local database — "
+            "traffic to a remote host would be sent in plaintext."
+        )
+        return None
+
+    if mode == "verify":
+        if not settings.DB_SSL_CA:
+            raise RuntimeError(
+                "DB_SSL_MODE=verify requires DB_SSL_CA to point at the provider's "
+                "CA certificate (Aiven: service page -> CA certificate)."
+            )
+        ca_path = Path(settings.DB_SSL_CA)
+        if not ca_path.is_file():
+            raise RuntimeError(f"DB_SSL_CA file not found: {ca_path}")
+
+        context = ssl.create_default_context(cafile=str(ca_path))
+        logger.info("Database TLS: encrypted, certificate verified against %s", ca_path)
+        return context
+
+    # mode == "require": encrypt, but do not validate the certificate. This
+    # defeats passive interception, not an active man-in-the-middle. Supply a
+    # CA and switch to `verify` where the data warrants it.
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    logger.warning(
+        "Database TLS: encrypted but the server certificate is NOT verified. "
+        "Set DB_SSL_CA and DB_SSL_MODE=verify for full protection."
+    )
+    return context
+
+
+_connect_args: dict[str, Any] = {}
+if _is_mysql:
+    _connect_args = {"charset": "utf8mb4", "connect_timeout": 15}
+    _ssl_context = _mysql_ssl_context()
+    if _ssl_context is not None:
+        _connect_args["ssl"] = _ssl_context
+elif _is_sqlite:
+    # SQLite is only used for local development and tests. FastAPI runs sync
+    # endpoints on a thread pool, so its default same-thread guard has to be
+    # relaxed for connections to be reusable across requests.
+    _connect_args = {"check_same_thread": False}
+
+_engine_options: dict[str, Any] = {
+    "echo": settings.DB_ECHO,
+    "connect_args": _connect_args,
+    # Verify a pooled connection before handing it out; MySQL closes idle
+    # connections and the alternative is an intermittent 500 on the first
+    # request after a quiet period.
+    "pool_pre_ping": True,
+}
+
+if not _is_sqlite:
+    # SQLite's default pool does not accept these, and pooling a local file
+    # would gain nothing anyway.
+    _engine_options.update(
+        poolclass=QueuePool,
+        pool_size=settings.DB_POOL_SIZE,
+        max_overflow=settings.DB_MAX_OVERFLOW,
+        pool_recycle=settings.DB_POOL_RECYCLE,
+        pool_timeout=settings.DB_POOL_TIMEOUT,
+    )
+
+engine = create_engine(settings.DATABASE_URL, **_engine_options)
+
+
+def create_db_and_tables() -> None:
+    """Create any missing tables and widen the large text columns.
+
+    Raises:
+        SQLAlchemyError: if the schema cannot be created; start-up should fail.
+    """
+    SQLModel.metadata.create_all(engine)
+    logger.info("Database schema verified")
+
+    if not _is_mysql:
+        return
+
+    # MySQL only: SQLModel maps str to TEXT, which truncates longer advice.
+    with engine.begin() as connection:
+        for table, column in LONGTEXT_COLUMNS:
+            try:
+                connection.execute(text(f"ALTER TABLE {table} MODIFY {column} LONGTEXT"))
+                logger.debug("Ensured %s.%s is LONGTEXT", table, column)
+            except SQLAlchemyError as exc:
+                logger.warning("Could not widen %s.%s to LONGTEXT: %s", table, column, exc)
+
+
+def get_session() -> Iterator[Session]:
+    """FastAPI dependency yielding a request-scoped session."""
     with Session(engine) as session:
         try:
             yield session
-        except Exception as e:
+        except Exception:
             session.rollback()
-            logger.error(f"Database session error: {e}")
             raise
-        finally:
-            session.close()
+
 
 @contextmanager
-def get_db_session():
-    """Context manager for DB sessions outside FastAPI dependencies."""
+def session_scope() -> Iterator[Session]:
+    """Transactional session for use outside the request cycle.
+
+    Commits on success, rolls back on error.
+    """
     session = Session(engine)
     try:
         yield session
         session.commit()
-    except Exception as e:
+    except Exception:
         session.rollback()
-        logger.error(f"Database transaction error: {e}")
+        logger.exception("Database transaction rolled back")
         raise
     finally:
         session.close()
 
-# ───────────────────────────
-# HEALTH + STATS
-# ───────────────────────────
-def test_database_connection() -> bool:
-    """Simple connection test."""
+
+def check_connection() -> bool:
+    """Return True when the database answers a trivial query."""
     try:
-        with Session(engine) as session:
-            session.execute(text("SELECT 1"))
-        logger.info("Database connection test successful.")
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
         return True
-    except Exception as e:
-        logger.error(f"Database connection test failed: {e}")
+    except SQLAlchemyError as exc:
+        logger.error("Database connection check failed: %s", exc)
         return False
 
-def get_database_stats():
-    """Return connection pool + MySQL status info."""
+
+def pool_stats() -> dict[str, Any]:
+    """Connection-pool counters, for the health endpoint and dashboards."""
+    pool = engine.pool
     try:
-        with engine.connect() as conn:
-            threads_connected = conn.execute(
-                text("SHOW STATUS LIKE 'Threads_connected'")
-            ).fetchone()
-            processes = conn.execute(text("SHOW PROCESSLIST")).fetchall()
-            return {
-                "pool_size": engine.pool.size(),
-                "checked_out": engine.pool.checkedout(),
-                "threads_connected": threads_connected[1] if threads_connected else 0,
-                "active_processes": len(processes),
-            }
-    except Exception as e:
-        logger.error(f"Error getting database stats: {e}")
+        return {
+            "size": pool.size(),
+            "checked_out": pool.checkedout(),
+            "overflow": pool.overflow(),
+        }
+    except AttributeError:  # pragma: no cover - non-queue pools
         return {}
 
-def check_database_health():
-    """Comprehensive health check: connection + table existence + pool stats."""
-    status = {"status": "healthy", "details": {}}
-    try:
-        if not test_database_connection():
-            status["status"] = "unhealthy"
-            status["details"]["connection"] = "failed"
-            return status
 
-        with Session(engine) as session:
-            tables_to_check = ["users", "vitals_records", "conversation_history"]
-            for table in tables_to_check:
-                try:
-                    session.execute(text(f"SELECT 1 FROM {table} LIMIT 1"))
-                    status["details"][f"table_{table}"] = "exists"
-                except Exception:
-                    status["details"][f"table_{table}"] = "missing"
-                    status["status"] = "degraded"
-
-        pool_stats = get_database_stats()
-        status["details"]["pool_stats"] = pool_stats
-
-        # Detect long-running queries (>60s)
-        with Session(engine) as session:
-            result = session.execute(
-                text(
-                    "SELECT COUNT(*) "
-                    "FROM information_schema.processlist "
-                    "WHERE TIME > 60 AND COMMAND != 'Sleep'"
-                )
-            )
-            long_running = result.scalar()
-            if long_running > 0:
-                status["details"]["long_running_queries"] = long_running
-                status["status"] = "degraded"
-
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-        status["status"] = "unhealthy"
-        status["error"] = str(e)
-
-    return status
-
-# ───────────────────────────
-# MAINTENANCE + BACKUP
-# ───────────────────────────
-def optimize_database():
-    """Run OPTIMIZE TABLE on key tables (MySQL equivalent of VACUUM)."""
-    try:
-        with Session(engine) as session:
-            for table in ["users", "vitals_records", "conversation_history"]:
-                session.execute(text(f"OPTIMIZE TABLE {table}"))
-            session.commit()
-        logger.info("Database optimization completed successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"Database optimization failed: {e}")
-        return False
-
-def backup_database(backup_path: str = "/backups"):
-    """Placeholder for DB backup logic."""
-    try:
-        logger.info(f"Database backup initiated to {backup_path}")
-        # implement mysqldump or your backup method here
-        return True
-    except Exception as e:
-        logger.error(f"Database backup failed: {e}")
-        return False
-
-# ───────────────────────────
-# OPTIONAL: ASYNC SUPPORT
-# ───────────────────────────
-try:
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.orm import sessionmaker
-
-    async_engine = create_async_engine(
-        settings.DATABASE_URL.replace("mysql+pymysql", "mysql+aiomysql"),
-        echo=settings.DB_ECHO,
-        poolclass=QueuePool,
-        pool_size=settings.DB_POOL_SIZE,
-        max_overflow=settings.DB_MAX_OVERFLOW,
-    )
-
-    AsyncSessionLocal = sessionmaker(
-        bind=async_engine, class_=AsyncSession, expire_on_commit=False
-    )
-
-    async def get_async_session():
-        async with AsyncSessionLocal() as session:
-            try:
-                yield session
-            except Exception as e:
-                await session.rollback()
-                logger.error(f"Async database session error: {e}")
-                raise
-            finally:
-                await session.close()
-
-except ImportError:
-    logger.warning("Async database dependencies not available. Async features disabled.")
-
-    async def get_async_session():
-        raise NotImplementedError("Async database sessions not configured.")
+def dispose_engine() -> None:
+    """Close every pooled connection. Called during application shutdown."""
+    engine.dispose()
+    logger.info("Database connection pool closed")

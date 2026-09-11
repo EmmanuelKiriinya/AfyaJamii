@@ -1,1 +1,18 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-ssr/
+*.local
+
+# Environment — real values must never be committed
+.env
+.env.local
+.env.*.local
+
+# Editors and tooling
 .vercel
+.DS_Store
+*.tsbuildinfo
+.env*

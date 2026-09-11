@@ -1,239 +1,307 @@
-import { useState } from 'react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Textarea } from '@/components/ui/textarea';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { useAuth } from '@/contexts/AuthContext';
-import { api, VitalsSubmitResponse } from '@/lib/api';
-import { useToast } from '@/hooks/use-toast';
-import { Thermometer, User, Heart, Activity, TrendingUp, Loader2 } from 'lucide-react';
-import { Textarea } from '@/components/ui/textarea';
+import { useState } from "react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Icon, IconSpinner } from "@/components/Icon";
+import { useAuth } from "@/contexts/AuthContext";
+import { useToast } from "@/hooks/use-toast";
+import { useSubmitVitals } from "@/lib/queries";
+import { ApiError, type TemperatureUnit, type VitalsSubmitResponse } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import type { IconName } from "@/lib/icons";
 
 interface VitalsFormProps {
-  onSubmitSuccess: (data: VitalsSubmitResponse) => void;
+  onAssessment: (data: VitalsSubmitResponse) => void;
 }
 
-const VitalsForm = ({ onSubmitSuccess }: VitalsFormProps) => {
-  const { token, accountType } = useAuth();
-  const { toast } = useToast();
-  const [isLoading, setIsLoading] = useState(false);
-  
-  const [vitals, setVitals] = useState({
-    age: '',
-    systolic_bp: '',
-    diastolic_bp: '',
-    bs: '',
-    body_temp: '',
-    body_temp_unit: 'celsius' as 'celsius' | 'fahrenheit',
-    heart_rate: '',
-    patient_history: '',
-  });
+interface FormState {
+  age: string;
+  systolic_bp: string;
+  diastolic_bp: string;
+  bs: string;
+  body_temp: string;
+  heart_rate: string;
+  patient_history: string;
+}
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    
-    if (!token || !accountType) {
-      toast({
-        title: 'Error',
-        description: 'Please login again',
-        variant: 'destructive',
-      });
-      return;
+interface FieldSpec {
+  key: keyof FormState;
+  label: string;
+  icon: IconName;
+  unit: string;
+  hint: string;
+  min: number;
+  max: number;
+  step?: string;
+  placeholder: string;
+}
+
+const EMPTY_FORM: FormState = {
+  age: "",
+  systolic_bp: "",
+  diastolic_bp: "",
+  bs: "",
+  body_temp: "",
+  heart_rate: "",
+  patient_history: "",
+};
+
+// Ranges mirror the API schema, so out-of-range values are caught before a
+// round trip rather than coming back as a 422.
+const FIELDS: FieldSpec[] = [
+  { key: "age", label: "Age", icon: "age", unit: "years", hint: "Between 15 and 50", min: 15, max: 50, placeholder: "28" },
+  { key: "systolic_bp", label: "Systolic BP", icon: "bloodPressure", unit: "mmHg", hint: "The upper number", min: 70, max: 200, placeholder: "120" },
+  { key: "diastolic_bp", label: "Diastolic BP", icon: "bloodPressure", unit: "mmHg", hint: "The lower number", min: 40, max: 130, placeholder: "80" },
+  { key: "heart_rate", label: "Heart rate", icon: "heartRate", unit: "bpm", hint: "Usually 60–100 at rest", min: 40, max: 150, placeholder: "76" },
+  { key: "bs", label: "Blood sugar", icon: "bloodSugar", unit: "mmol/L", hint: "Usually 4.0–7.0", min: 3, max: 30, step: "0.1", placeholder: "5.5" },
+];
+
+const TEMPERATURE_RANGES: Record<TemperatureUnit, { min: number; max: number; hint: string }> = {
+  celsius: { min: 35, max: 42, hint: "Normal is about 36.5–37.5 °C" },
+  fahrenheit: { min: 95, max: 107.6, hint: "Normal is about 97.7–99.5 °F" },
+};
+
+const VitalsForm = ({ onAssessment }: VitalsFormProps) => {
+  const { accountType } = useAuth();
+  const { toast } = useToast();
+  const submitVitals = useSubmitVitals();
+
+  const [form, setForm] = useState<FormState>(EMPTY_FORM);
+  const [unit, setUnit] = useState<TemperatureUnit>("celsius");
+  const [errors, setErrors] = useState<Partial<Record<keyof FormState, string>>>({});
+
+  const isLoading = submitVitals.isPending;
+
+  const update = (key: keyof FormState, value: string) => {
+    setForm((current) => ({ ...current, [key]: value }));
+    setErrors((current) => ({ ...current, [key]: undefined }));
+  };
+
+  const validate = (): boolean => {
+    const found: Partial<Record<keyof FormState, string>> = {};
+
+    for (const field of FIELDS) {
+      const raw = form[field.key].trim();
+      if (!raw) {
+        found[field.key] = "Required.";
+        continue;
+      }
+      const value = Number(raw);
+      if (Number.isNaN(value)) {
+        found[field.key] = "Enter a number.";
+      } else if (value < field.min || value > field.max) {
+        found[field.key] = `Must be ${field.min}–${field.max}.`;
+      }
     }
 
-    try {
-      setIsLoading(true);
-      const payload = {
-        vitals: {
-          age: Number(vitals.age),
-          systolic_bp: Number(vitals.systolic_bp),
-          diastolic_bp: Number(vitals.diastolic_bp),
-          bs: Number(vitals.bs),
-          body_temp: Number(vitals.body_temp),
-          body_temp_unit: vitals.body_temp_unit,
-          heart_rate: Number(vitals.heart_rate),
-          patient_history: vitals.patient_history,
-        },
-        account_type: accountType as 'pregnant' | 'postnatal' | 'general',
-      };
+    const range = TEMPERATURE_RANGES[unit];
+    const temperature = Number(form.body_temp.trim());
+    if (!form.body_temp.trim()) {
+      found.body_temp = "Required.";
+    } else if (Number.isNaN(temperature)) {
+      found.body_temp = "Enter a number.";
+    } else if (temperature < range.min || temperature > range.max) {
+      found.body_temp = `Must be ${range.min}–${range.max}.`;
+    }
 
-      const response = await api.submitVitals(payload, token);
-      onSubmitSuccess(response);
-      
+    // The API rejects this too, but catching it here explains it better.
+    if (!found.systolic_bp && !found.diastolic_bp) {
+      if (Number(form.diastolic_bp) >= Number(form.systolic_bp)) {
+        found.diastolic_bp = "Must be below the upper number.";
+      }
+    }
+
+    setErrors(found);
+    if (Object.keys(found).length > 0) {
       toast({
-        title: 'Success',
-        description: 'Vitals submitted successfully',
+        title: "Check your readings",
+        description: "Some values need correcting before we can assess them.",
+        variant: "destructive",
+      });
+      return false;
+    }
+    return true;
+  };
+
+  const handleSubmit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!validate()) return;
+
+    try {
+      const response = await submitVitals.mutateAsync({
+        vitals: {
+          age: Number(form.age),
+          systolic_bp: Number(form.systolic_bp),
+          diastolic_bp: Number(form.diastolic_bp),
+          bs: Number(form.bs),
+          body_temp: Number(form.body_temp),
+          body_temp_unit: unit,
+          heart_rate: Number(form.heart_rate),
+          patient_history: form.patient_history.trim() || undefined,
+        },
+        account_type: accountType ?? undefined,
       });
 
-      // Reset form
-      setVitals({
-        age: '',
-        systolic_bp: '',
-        diastolic_bp: '',
-        bs: '',
-        body_temp: '',
-        body_temp_unit: 'celsius',
-        heart_rate: '',
-        patient_history: '',
-      });
+      onAssessment(response);
+      setForm(EMPTY_FORM);
+      toast({ title: "Saved", description: "Your readings have been assessed." });
     } catch (error) {
       toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to submit vitals',
-        variant: 'destructive',
+        title: "Could not save",
+        description:
+          error instanceof ApiError ? error.message : "Failed to submit your readings",
+        variant: "destructive",
       });
-    } finally {
-      setIsLoading(false);
     }
   };
 
   return (
-    <Card className="max-w-3xl mx-auto shadow-lg">
-      <CardHeader className="bg-gradient-to-r from-primary/5 to-purple-500/5 border-b">
-        <CardTitle className="flex items-center gap-2 text-2xl">
-          <div className="h-10 w-10 bg-primary/10 rounded-full flex items-center justify-center">
-            <Thermometer className="h-5 w-5 text-primary" />
-          </div>
-          Submit Your Vitals
+    <Card className="mx-auto max-w-3xl border-2 border-primary/10 shadow-lg">
+      <CardHeader className="border-b bg-gradient-to-r from-primary/5 to-purple-500/5">
+        <CardTitle className="flex items-center gap-3 text-2xl">
+          <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-blue-600 text-primary-foreground">
+            <Icon name="vitals" size={22} />
+          </span>
+          New reading
         </CardTitle>
-        <CardDescription className="text-base">Enter your current vital signs for AI-powered risk assessment and personalized health insights</CardDescription>
+        <CardDescription className="text-base">
+          Enter the numbers from your clinic card or home monitor for an assessment.
+        </CardDescription>
       </CardHeader>
+
       <CardContent className="pt-6">
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            <div className="space-y-2">
-              <Label htmlFor="age" className="text-sm font-medium flex items-center gap-2">
-                <User className="h-4 w-4 text-muted-foreground" />
-                Age (years)
-              </Label>
-              <Input
-                id="age"
-                type="number"
-                value={vitals.age}
-                onChange={(e) => setVitals({ ...vitals, age: e.target.value })}
-                placeholder="e.g., 28"
-                required
-                className="h-11"
-              />
-              <p className="text-xs text-muted-foreground">Your current age</p>
-            </div>
+        <form onSubmit={handleSubmit} className="space-y-6" noValidate>
+          <div className="grid grid-cols-1 gap-5 md:grid-cols-2">
+            {FIELDS.map((field) => (
+              <div key={field.key} className="space-y-2">
+                <Label htmlFor={field.key} className="flex items-center gap-2 text-sm font-medium">
+                  <Icon name={field.icon} size={15} className="text-primary" />
+                  {field.label}
+                  <span className="font-normal text-muted-foreground">({field.unit})</span>
+                </Label>
+                <Input
+                  id={field.key}
+                  type="number"
+                  inputMode="decimal"
+                  step={field.step ?? "1"}
+                  min={field.min}
+                  max={field.max}
+                  placeholder={field.placeholder}
+                  value={form[field.key]}
+                  onChange={(event) => update(field.key, event.target.value)}
+                  disabled={isLoading}
+                  className={cn("tabular h-11", errors[field.key] && "border-destructive")}
+                  aria-invalid={Boolean(errors[field.key])}
+                  aria-describedby={`${field.key}-hint`}
+                />
+                <p
+                  id={`${field.key}-hint`}
+                  className={cn(
+                    "text-xs",
+                    errors[field.key] ? "text-destructive" : "text-muted-foreground",
+                  )}
+                >
+                  {errors[field.key] ?? field.hint}
+                </p>
+              </div>
+            ))}
 
+            {/* Temperature carries its own unit switch. */}
             <div className="space-y-2">
-              <Label htmlFor="heart_rate" className="text-sm font-medium flex items-center gap-2">
-                <Heart className="h-4 w-4 text-muted-foreground" />
-                Heart Rate (bpm)
-              </Label>
-              <Input
-                id="heart_rate"
-                type="number"
-                value={vitals.heart_rate}
-                onChange={(e) => setVitals({ ...vitals, heart_rate: e.target.value })}
-                placeholder="e.g., 75"
-                required
-                className="h-11"
-              />
-              <p className="text-xs text-muted-foreground">Normal range: 60-100 bpm</p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="systolic_bp" className="text-sm font-medium flex items-center gap-2">
-                <Activity className="h-4 w-4 text-muted-foreground" />
-                Systolic BP (mmHg)
-              </Label>
-              <Input
-                id="systolic_bp"
-                type="number"
-                value={vitals.systolic_bp}
-                onChange={(e) => setVitals({ ...vitals, systolic_bp: e.target.value })}
-                placeholder="e.g., 120"
-                required
-                className="h-11"
-              />
-              <p className="text-xs text-muted-foreground">Upper blood pressure reading</p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="diastolic_bp" className="text-sm font-medium flex items-center gap-2">
-                <Activity className="h-4 w-4 text-muted-foreground" />
-                Diastolic BP (mmHg)
-              </Label>
-              <Input
-                id="diastolic_bp"
-                type="number"
-                value={vitals.diastolic_bp}
-                onChange={(e) => setVitals({ ...vitals, diastolic_bp: e.target.value })}
-                placeholder="e.g., 80"
-                required
-                className="h-11"
-              />
-              <p className="text-xs text-muted-foreground">Lower blood pressure reading</p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="bs" className="text-sm font-medium flex items-center gap-2">
-                <TrendingUp className="h-4 w-4 text-muted-foreground" />
-                Blood Sugar (mmol/L)
-              </Label>
-              <Input
-                id="bs"
-                type="number"
-                step="0.1"
-                value={vitals.bs}
-                onChange={(e) => setVitals({ ...vitals, bs: e.target.value })}
-                placeholder="e.g., 5.5"
-                required
-                className="h-11"
-              />
-              <p className="text-xs text-muted-foreground">Normal range: 4.0-7.0 mmol/L</p>
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="body_temp" className="text-sm font-medium flex items-center gap-2">
-                <Thermometer className="h-4 w-4 text-muted-foreground" />
-                Body Temperature
+              <Label htmlFor="body_temp" className="flex items-center gap-2 text-sm font-medium">
+                <Icon name="temperature" size={15} className="text-primary" />
+                Temperature
               </Label>
               <div className="flex gap-2">
                 <Input
                   id="body_temp"
                   type="number"
+                  inputMode="decimal"
                   step="0.1"
-                  value={vitals.body_temp}
-                  onChange={(e) => setVitals({ ...vitals, body_temp: e.target.value })}
-                  placeholder="e.g., 37.0"
-                  required
-                  className="flex-1 h-11"
+                  min={TEMPERATURE_RANGES[unit].min}
+                  max={TEMPERATURE_RANGES[unit].max}
+                  placeholder={unit === "celsius" ? "36.9" : "98.4"}
+                  value={form.body_temp}
+                  onChange={(event) => update("body_temp", event.target.value)}
+                  disabled={isLoading}
+                  className={cn("tabular h-11 flex-1", errors.body_temp && "border-destructive")}
+                  aria-invalid={Boolean(errors.body_temp)}
+                  aria-describedby="body_temp-hint"
                 />
-                <Select 
-                  value={vitals.body_temp_unit} 
-                  onValueChange={(value: 'celsius' | 'fahrenheit') => 
-                    setVitals({ ...vitals, body_temp_unit: value })
-                  }
+                <div
+                  role="group"
+                  aria-label="Temperature unit"
+                  className="flex shrink-0 overflow-hidden rounded-md border border-input"
                 >
-                  <SelectTrigger className="w-28 h-11">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="celsius">°C</SelectItem>
-                    <SelectItem value="fahrenheit">°F</SelectItem>
-                  </SelectContent>
-                </Select>
+                  {(["celsius", "fahrenheit"] as const).map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      onClick={() => {
+                        setUnit(option);
+                        // The number means something different in the other
+                        // scale, so clear it rather than mislabel it.
+                        update("body_temp", "");
+                      }}
+                      disabled={isLoading}
+                      aria-pressed={unit === option}
+                      className={cn(
+                        "px-3.5 text-sm transition-colors",
+                        unit === option
+                          ? "bg-primary text-primary-foreground"
+                          : "hover:bg-muted",
+                      )}
+                    >
+                      °{option === "celsius" ? "C" : "F"}
+                    </button>
+                  ))}
+                </div>
               </div>
-              <p className="text-xs text-muted-foreground">Normal: 36.5-37.5°C / 97.7-99.5°F</p>
+              <p
+                id="body_temp-hint"
+                className={cn(
+                  "text-xs",
+                  errors.body_temp ? "text-destructive" : "text-muted-foreground",
+                )}
+              >
+                {errors.body_temp ?? TEMPERATURE_RANGES[unit].hint}
+              </p>
             </div>
           </div>
 
-          <Button type="submit" className="w-full h-12 text-base font-medium" disabled={isLoading}>
+          {/* This field was collected in state but never rendered, so the
+              history a user typed could never actually be entered. */}
+          <div className="space-y-2">
+            <Label htmlFor="patient_history" className="text-sm font-medium">
+              Anything else worth knowing?
+            </Label>
+            <Textarea
+              id="patient_history"
+              rows={3}
+              maxLength={1000}
+              placeholder="Previous pregnancies, conditions you are managing, medicines you take, how you have been feeling…"
+              value={form.patient_history}
+              onChange={(event) => update("patient_history", event.target.value)}
+              disabled={isLoading}
+              className="resize-y"
+            />
+            <p className="text-xs text-muted-foreground">
+              Optional, but it makes the guidance more useful. {form.patient_history.length}/1000
+            </p>
+          </div>
+
+          <Button type="submit" className="h-12 w-full text-base font-medium" disabled={isLoading}>
             {isLoading ? (
               <>
-                <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                Analyzing Your Vitals...
+                <IconSpinner size={18} className="mr-2" />
+                Checking your readings...
               </>
             ) : (
               <>
-                <Activity className="mr-2 h-5 w-5" />
-                Submit Vitals & Get AI Analysis
+                <Icon name="vitals" size={18} className="mr-2" />
+                Check my readings
               </>
             )}
           </Button>

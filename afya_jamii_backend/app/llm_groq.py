@@ -1,175 +1,163 @@
-import os
-from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-from app.config import settings
+"""Groq-backed language model client.
+
+The model name, temperature, token budget, and timeouts all come from the
+environment (see ``app.config``), and the prompt itself is read from a JSON
+file under ``app/prompts`` (see ``app.prompt_loader``). Nothing in this module
+hard-codes either.
+"""
+
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
+from typing import Any, Mapping, Optional
+
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+
+from app.config import settings
+from app.prompt_loader import Prompt, PromptError, PromptLibrary
 
 logger = logging.getLogger(__name__)
 
+# Shown to users when the upstream model is unreachable. Deliberately plain:
+# it must never read as clinical advice.
+UNAVAILABLE_MESSAGE = (
+    "I can't reach the advice service right now. Please try again in a few minutes. "
+    "If this is urgent, contact your nearest health facility, or call 1199 "
+    "(Kenya Red Cross) or 999."
+)
+
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when the language model cannot serve a request."""
+
+
+@dataclass(frozen=True)
+class LLMStatus:
+    """A snapshot of the client's health, for the /health endpoint."""
+
+    ready: bool
+    model: str
+    prompt_id: Optional[str] = None
+    prompt_version: Optional[str] = None
+    error: Optional[str] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ready": self.ready, "model": self.model}
+        if self.prompt_id:
+            payload["prompt"] = f"{self.prompt_id}@{self.prompt_version}"
+        if self.error:
+            payload["error"] = self.error
+        return payload
+
+
 class AfyaJamiiLLM:
-    def __init__(self):
-        self.llm = None
-        self.chain = None
-        self.initialize_llm()
-    
-    def initialize_llm(self):
-        """Initialize Groq LLM with configuration from settings"""
+    """Wraps the Groq chat model together with the clinical prompt."""
+
+    def __init__(self, library: PromptLibrary | None = None) -> None:
+        self._library = library or PromptLibrary(
+            settings.prompt_directory,
+            reload_on_change=settings.PROMPT_RELOAD_ON_CHANGE,
+        )
+        self._llm: Optional[ChatGroq] = None
+        self._prompt: Optional[Prompt] = None
+        self._chain = None
+        self._error: Optional[str] = None
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────
+
+    def initialize(self) -> bool:
+        """Build the model client and chain. Returns True when usable.
+
+        Failures are logged and recorded rather than raised: the rest of the
+        API — authentication, vitals capture, risk scoring, history — stays
+        available even when the advice service is down.
+        """
         try:
-            if not settings.GROQ_API_KEY or settings.GROQ_API_KEY == "your-groq-api-key-here":
-                logger.error("GROQ_API_KEY not configured")
-                return
-            
-            self.llm = ChatGroq(
+            self._prompt = self._library.get(settings.PROMPT_NAME)
+
+            self._llm = ChatGroq(
                 model=settings.LLM_MODEL_NAME,
                 temperature=settings.LLM_TEMPERATURE,
-                api_key=settings.GROQ_API_KEY
+                max_tokens=settings.LLM_MAX_TOKENS,
+                timeout=settings.LLM_TIMEOUT_SECONDS,
+                max_retries=settings.LLM_MAX_RETRIES,
+                api_key=settings.GROQ_API_KEY,
             )
-            
-            # Create prompt template
-            template = """
-You are Afya Jamii AI, a clinical decision-support and maternal nutrition assistant for Kenyan pregnant and postnatal mothers and general users seeking nutrition advice.
-This is the context for the current conversation:
-{context}
 
-This is the conversation history:
-{history}
-
-Based on the context and history, answer the following question:
-Question: {question}
-
-Guidelines for response:
-- Only introduce yourself as "Afya Jamii AI" at the start of the session only or incase asked.
-- If patient data is available in the context or history, base your reasoning on it.
-- Provide actionable, evidence-based recommendations tailored for Kenyan healthcare context.
-- Include specific Kenyan food examples for nutrition advice.
-- Keep responses clear, structured, and medically accurate.
-- Do not mention the underlying ML model unless asked.
-- Respond in English or Swahili based on the user's preference or how they kick-off the conversation. 
-- Be interactive and empathetic in your responses and avoid sounding robotic.
-- If uncertain about a medical question, advise consulting a qualified healthcare professional.
-- Incase someone asks for emergency help, advise them to contact local emergency services immediately through the following numbers.
-- Kindly ensure you first ask for their location to provide accurate contact and if the location(county) they provide is not provided in the emergency contact list,
-provide the general national emergency contacts.
-National & Nationwide Ambulance Contacts:
-
-# Emergency Ambulance & Medical Response Contacts – Kenya
-
-## National Emergency Services (Countrywide)
-
-**Public Emergency Numbers**  
-- **999**, **112**, **911**  
-Toll-free national emergency lines for police, fire, and ambulance services. Coverage is strongest in major cities.
-
-**Kenya Red Cross – Emergency Plus (E-Plus)**  
-Type: Ground ambulance  
-Coverage: Nationwide (all 47 counties)  
-Contacts: **1199 (toll-free)**, **0700 395 395**, **0738 395 395**  
-Availability: 24/7  
-Fleet: 100+ ambulances
-
-**St. John Ambulance Kenya**  
-Type: Ground ambulance  
-Coverage: Nationwide  
-Contact: **0721 225 285**  
-Availability: 24/7
-
-**AMREF Flying Doctors**  
-Type: Air ambulance and medical evacuation  
-Coverage: Regional  
-Contact: **0722 207 350**  
-Availability: 24/7
-
-**Flare Emergency Response**  
-Type: Multi-provider emergency dispatch platform  
-Contact: **0714 911 911**
-
----
-
-## County-Level Emergency Contacts
-
-### Nairobi County
-County Ambulance Dispatch: **1508**  
-Public Hospital: Kenyatta National Hospital – **+254 20 2726300**  
-Private Hospitals:  
-- The Nairobi Hospital – **0702 200200**  
-- Mater Hospital – **0719 073000 / 0732 163000**  
-- MP Shah Hospital – **0722 204427 / 0733 606113**  
-- Gertrude’s Children’s Hospital – **0730 644000 / 0709 529000**  
-Notes: Use county dispatch first; fallback to Red Cross or St. John if unavailable.
-
-### Mombasa County
-County Ambulance Dispatch: **0788 959626**  
-Public Hospital: Coast General Teaching & Referral Hospital – **0724 249443**  
-Private Hospitals:  
-- Aga Khan Hospital Mombasa – **0714 524948**  
-- Premier Hospital Nyali – **0714 400099**
-
-### Kisumu County
-County Emergency Operations Centre: **0800 720575 / 0797 067459**  
-Public Hospital: Jaramogi O. O. Teaching & Referral Hospital – **057 202 3681**  
-Private Hospital: Aga Khan Hospital Kisumu – **0722 203622 / 0733 637566**
-
-### Nakuru County
-County Emergency Line: **0800 724138**  
-Public Hospital: Nakuru Level 5 Hospital – **051 2212145**  
-Private Hospitals:  
-- Mediheal Hospital Nakuru – **0709 907000**  
-- Nairobi Women’s Hospital Nakuru – **0707 957840**
-
-### Kiambu County
-County Ambulance Dispatch: **0700 820227**  
-Public Hospital: Thika Level 5 Hospital – **067 22221**  
-Private Hospitals:  
-- Avenue Hospital Thika – **0711 060800**  
-- AIC Kijabe Hospital – **0758 720 044**
-
----
-
-## Counties Without Dedicated EMS Hotlines
-
-Marsabit, Lamu, Tana River, West Pokot, Busia, Siaya, Homa Bay
-
-For these counties, use:  
-- **999 or 112**  
-- **Kenya Red Cross – 1199**  
-- **St. John Ambulance – 0721 225 285**
-
-"""
-
-            self.prompt = PromptTemplate(
-                input_variables=["context", "history", "question"],
-                template=template
+            template = PromptTemplate(
+                template=self._prompt.template,
+                input_variables=list(self._prompt.input_variables),
             )
-            
-            # Create chain
-            self.chain = LLMChain(
-                llm=self.llm,
-                prompt=self.prompt,
-                verbose=settings.DEBUG
+            self._chain = template | self._llm | StrOutputParser()
+
+            self._error = None
+            logger.info(
+                "Language model ready: %s (prompt %s v%s, temperature %.2f)",
+                settings.LLM_MODEL_NAME,
+                self._prompt.id,
+                self._prompt.version,
+                settings.LLM_TEMPERATURE,
             )
-            
-            logger.info("Groq LLM initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize LLM: {e}")
-            self.llm = None
-    
-    def generate_advice(self, prompt_data: dict) -> str:
-        """Generate clinical advice using Groq LLM"""
-        if not self.chain:
-            return "LLM service temporarily unavailable. Please try again later."
-        
+            return True
+
+        except PromptError as exc:
+            self._error = f"prompt error: {exc}"
+            logger.error("Cannot load prompt for the language model: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - start-up must not crash the API
+            self._error = str(exc)
+            logger.exception("Failed to initialise the Groq client")
+
+        self._llm = None
+        self._chain = None
+        return False
+
+    # ── Inspection ─────────────────────────────────────────────────────────
+
+    @property
+    def is_ready(self) -> bool:
+        return self._chain is not None
+
+    def status(self) -> LLMStatus:
+        return LLMStatus(
+            ready=self.is_ready,
+            model=settings.LLM_MODEL_NAME,
+            prompt_id=self._prompt.id if self._prompt else None,
+            prompt_version=self._prompt.version if self._prompt else None,
+            error=self._error,
+        )
+
+    # ── Inference ──────────────────────────────────────────────────────────
+
+    async def generate_advice(self, values: Mapping[str, Any]) -> str:
+        """Run the clinical prompt and return the model's reply.
+
+        Raises:
+            LLMUnavailableError: if the client is not ready or the call fails.
+        """
+        if self._chain is None:
+            raise LLMUnavailableError("The language model is not initialised")
+
+        assert self._prompt is not None  # guaranteed once the chain exists
+        payload = {name: values.get(name, "") for name in self._prompt.input_variables}
+
         try:
-            response = self.chain.run(**prompt_data)
-            return response
-        except Exception as e:
-            logger.error(f"LLM generation error: {e}")
-            return f"Error generating advice: {str(e)}"
+            response = await self._chain.ainvoke(payload)
+        except Exception as exc:  # noqa: BLE001 - upstream errors vary widely
+            logger.exception("Language model request failed")
+            raise LLMUnavailableError(str(exc)) from exc
 
-# Global LLM instance
+        text = (response or "").strip()
+        if not text:
+            raise LLMUnavailableError("The language model returned an empty response")
+        return text
+
+
 afya_llm = AfyaJamiiLLM()
 
-def initialize_llm_service():
-    """Initialize LLM service on application startup"""
-    return afya_llm.llm is not None
+
+def initialize_llm_service() -> bool:
+    """Initialise the shared client. Called once during application start-up."""
+    return afya_llm.initialize()

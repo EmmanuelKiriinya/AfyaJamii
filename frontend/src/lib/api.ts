@@ -1,4 +1,37 @@
-const API_BASE_URL = 'https://afyajamii.onrender.com';
+/**
+ * Client for the Afya Jamii API.
+ *
+ * The base URL comes from VITE_API_BASE_URL so the same build can point at a
+ * local backend, staging, or production. It was previously hard-coded to a
+ * single hosted URL, which made local development impossible without editing
+ * source.
+ */
+
+const rawBaseUrl = import.meta.env.VITE_API_BASE_URL;
+
+/**
+ * True when the build has no API URL configured.
+ *
+ * This used to `throw` here, at module scope. Because this module is imported
+ * by the auth context and therefore by the whole app, a missing environment
+ * variable took the entire site down — including the landing page, which needs
+ * no API at all. A misconfiguration should degrade the parts that depend on
+ * the API, not blank the page, so it is now reported per request instead.
+ */
+const isUnconfigured = !rawBaseUrl && import.meta.env.PROD;
+
+if (isUnconfigured) {
+  console.error(
+    "VITE_API_BASE_URL is not set for this build. Static pages will render, " +
+      "but anything that talks to the API will fail until it is configured.",
+  );
+}
+
+const API_BASE_URL = (rawBaseUrl ?? "http://localhost:8000").replace(/\/+$/, "");
+const API_TIMEOUT_MS = Number(import.meta.env.VITE_API_TIMEOUT_MS ?? 60_000);
+
+export type AccountType = "pregnant" | "postnatal" | "general";
+export type TemperatureUnit = "celsius" | "fahrenheit";
 
 export interface LoginCredentials {
   username: string;
@@ -8,9 +41,27 @@ export interface LoginCredentials {
 export interface SignupData {
   username: string;
   email: string;
-  account_type: 'pregnant' | 'postnatal' | 'general';
+  account_type: AccountType;
   full_name: string;
   password: string;
+}
+
+export interface AuthSession {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  username: string;
+  account_type: AccountType;
+}
+
+export interface UserProfile {
+  id: number;
+  username: string;
+  email: string;
+  full_name: string | null;
+  account_type: AccountType;
+  created_at: string;
+  is_active: boolean;
 }
 
 export interface VitalsData {
@@ -19,164 +70,183 @@ export interface VitalsData {
   diastolic_bp: number;
   bs: number;
   body_temp: number;
-  body_temp_unit: 'celsius' | 'fahrenheit';
+  body_temp_unit: TemperatureUnit;
   heart_rate: number;
-  patient_history: string;
+  patient_history?: string;
 }
 
 export interface VitalsSubmitPayload {
   vitals: VitalsData;
-  account_type: 'pregnant' | 'postnatal' | 'general';
+  account_type?: AccountType;
 }
 
-export interface VitalsResponse {
-  id: number;
-  user_id: number;
-  age: number;
-  systolic_bp: number;
-  diastolic_bp: number;
-  bs: number;
-  body_temp: number;
-  body_temp_unit: string;
-  heart_rate: number;
-  patient_history: string;
-  ml_risk_label: string;
-  ml_probability: number;
-  ml_feature_importances: string | Record<string, number>;
-  created_at: string;
+export interface MLOutput {
+  risk_label: string;
+  probability: number;
+  class_probabilities: Record<string, number>;
+  feature_importances: Record<string, number>;
+}
+
+export interface Advice {
+  advice: string;
+  timestamp: string;
+  generated: boolean;
 }
 
 export interface VitalsSubmitResponse {
   user_id: number;
   submission_id: number;
   timestamp: string;
-  ml_output: {
-    risk_label: string;
-    probability: number;
-    feature_importances: Record<string, number>;
-  };
-  llm_advice: {
-    advice: string;
-    timestamp: string;
-  };
+  ml_output: MLOutput;
+  llm_advice: Advice;
 }
 
-export interface ConversationResponse {
+export interface VitalsRecord {
   id: number;
-  user_id: number;
-  vitals_record_id: number;
+  age: number;
+  systolic_bp: number;
+  diastolic_bp: number;
+  bs: number;
+  body_temp: number;
+  body_temp_unit: string;
+  patient_history: string | null;
+  heart_rate: number;
+  ml_risk_label: string;
+  ml_probability: number;
+  ml_feature_importances: Record<string, number>;
+  created_at: string;
+}
+
+export interface ConversationRecord {
+  id: number;
+  vitals_record_id: number | null;
   user_message: string;
   ai_response: string;
   created_at: string;
 }
 
-export interface ChatResponse {
-  advice: string;
-  timestamp: string;
+/** An error carrying the HTTP status, so callers can react to 401 and 503. */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly requestId?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+
+  /** The session is gone or invalid; the caller should sign the user out. */
+  get isUnauthorized() {
+    return this.status === 401;
+  }
+
+  /** A dependency is down; the request is worth retrying shortly. */
+  get isUnavailable() {
+    return this.status === 503;
+  }
+}
+
+interface ErrorBody {
+  detail?: string | { field?: string; message?: string }[];
+  request_id?: string;
+}
+
+/** Turn the API's error shape into a single sentence a person can act on. */
+function describeError(body: ErrorBody | null, status: number): string {
+  const detail = body?.detail;
+
+  if (typeof detail === "string") return detail;
+
+  if (Array.isArray(detail)) {
+    const problems = detail
+      .map((item) => (item.field ? `${item.field}: ${item.message}` : item.message))
+      .filter(Boolean);
+    if (problems.length > 0) return problems.join("; ");
+  }
+
+  if (status === 0) return "Could not reach the server. Check your connection and try again.";
+  if (status === 429) return "Too many requests. Please wait a moment before trying again.";
+  return `Request failed (${status}).`;
+}
+
+interface RequestOptions {
+  method?: "GET" | "POST";
+  body?: unknown;
+  token?: string;
+  signal?: AbortSignal;
+}
+
+async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const { method = "GET", body, token, signal } = options;
+
+  if (isUnconfigured) {
+    throw new ApiError(
+      "This site is not yet connected to its health service. Please try again shortly.",
+      0,
+    );
+  }
+
+  // Abort on timeout, but keep honouring a caller-supplied signal too.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  signal?.addEventListener("abort", () => controller.abort(), { once: true });
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      method,
+      headers: {
+        ...(body ? { "Content-Type": "application/json" } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+  } catch {
+    if (controller.signal.aborted) {
+      throw new ApiError("The request took too long. Please try again.", 0);
+    }
+    throw new ApiError("Could not reach the server. Check your connection.", 0);
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => null)) as ErrorBody | null;
+    throw new ApiError(
+      describeError(errorBody, response.status),
+      response.status,
+      errorBody?.request_id ?? response.headers.get("X-Request-ID") ?? undefined,
+    );
+  }
+
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
 }
 
 export const api = {
-  async login(credentials: LoginCredentials): Promise<{ token: string }> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(credentials),
-    });
+  login: (credentials: LoginCredentials) =>
+    request<AuthSession>("/api/v1/auth/login", { method: "POST", body: credentials }),
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Login failed' }));
-      throw new Error(error.detail || 'Login failed');
-    }
+  signup: (data: SignupData) =>
+    request<UserProfile>("/api/v1/auth/signup", { method: "POST", body: data }),
 
-    const data = await response.json();
-    // Handle both 'token' and 'access_token' field names
-    return { token: data.token || data.access_token };
-  },
+  me: (token: string) => request<UserProfile>("/api/v1/auth/me", { token }),
 
-  async signup(data: SignupData): Promise<{ message: string }> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/auth/signup`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(data),
-    });
+  submitVitals: (payload: VitalsSubmitPayload, token: string) =>
+    request<VitalsSubmitResponse>("/api/v1/vitals/submit", {
+      method: "POST",
+      body: payload,
+      token,
+    }),
 
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Signup failed' }));
-      throw new Error(error.detail || 'Signup failed');
-    }
+  chatAdvice: (question: string, token: string) =>
+    request<Advice>("/api/v1/chat/advice", { method: "POST", body: { question }, token }),
 
-    return response.json();
-  },
+  getVitalsHistory: (token: string, limit = 10) =>
+    request<VitalsRecord[]>(`/api/v1/history/vitals?limit=${limit}`, { token }),
 
-  async submitVitals(payload: VitalsSubmitPayload, token: string): Promise<VitalsSubmitResponse> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/vitals/submit`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Failed to submit vitals' }));
-      throw new Error(error.detail || 'Failed to submit vitals');
-    }
-
-    return response.json();
-  },
-
-  async chatAdvice(question: string, token: string): Promise<ChatResponse> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/chat/advice`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-      body: JSON.stringify({ question }),
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Failed to get advice' }));
-      throw new Error(error.detail || 'Failed to get advice');
-    }
-
-    return response.json();
-  },
-
-  async getVitalsHistory(token: string, limit: number = 10): Promise<VitalsResponse[]> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/history/vitals?limit=${limit}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-      },
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Failed to fetch vitals history' }));
-      throw new Error(error.detail || 'Failed to fetch vitals history');
-    }
-
-    return response.json();
-  },
-
-  async getConversationsHistory(token: string, limit: number = 10): Promise<ConversationResponse[]> {
-    const response = await fetch(`${API_BASE_URL}/api/v1/history/conversations?limit=${limit}`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${token}`,
-      },
-    });
-
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({ detail: 'Failed to fetch conversations history' }));
-      throw new Error(error.detail || 'Failed to fetch conversations history');
-    }
-
-    return response.json();
-  },
+  getConversationsHistory: (token: string, limit = 20) =>
+    request<ConversationRecord[]>(`/api/v1/history/conversations?limit=${limit}`, { token }),
 };
