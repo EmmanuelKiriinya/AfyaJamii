@@ -385,6 +385,38 @@ def test_username_cannot_collide_with_another_account(client, account):
     assert client.get("/api/v1/users/me", headers=account["headers"]).json()["username"] == account["username"]
 
 
+def test_signup_username_clash_is_case_insensitive_and_named_correctly(client, account):
+    # Production MySQL matches usernames case-insensitively; the 409 used to
+    # blame the email for what was a username clash.
+    response = client.post(
+        "/api/v1/auth/signup",
+        json={
+            "username": account["username"].upper(),
+            "email": f"fresh_{uuid.uuid4().hex[:8]}@example.co.ke",
+            "full_name": "Other",
+            "account_type": "general",
+            "password": PASSWORD,
+        },
+    )
+    assert response.status_code == 409
+    assert "username" in response.json()["detail"]
+
+
+def test_signup_email_clash_is_case_insensitive(client, account):
+    response = client.post(
+        "/api/v1/auth/signup",
+        json={
+            "username": f"fresh_{uuid.uuid4().hex[:8]}",
+            "email": account["email"].upper(),
+            "full_name": "Other",
+            "account_type": "general",
+            "password": PASSWORD,
+        },
+    )
+    assert response.status_code == 409
+    assert "email" in response.json()["detail"]
+
+
 @pytest.mark.parametrize("bad", ["ab", "has spaces", "sym$bol", "x" * 51])
 def test_invalid_usernames_are_rejected(client, account, bad):
     response = client.patch(

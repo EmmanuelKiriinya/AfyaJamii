@@ -31,6 +31,7 @@ from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
@@ -430,13 +431,17 @@ async def signup(
     user_data: UserCreate,
     session: Session = Depends(get_session),
 ) -> UserDB:
+    # Compare case-insensitively: MySQL's default collation already treats
+    # "Amina" and "amina" as the same username, so the check that picks the
+    # message must too, or a username clash is reported as an email clash.
     existing = session.exec(
         select(UserDB).where(
-            (UserDB.username == user_data.username) | (UserDB.email == user_data.email)
+            (func.lower(UserDB.username) == user_data.username.lower())
+            | (func.lower(UserDB.email) == user_data.email.lower())
         )
     ).first()
     if existing is not None:
-        field = "username" if existing.username == user_data.username else "email"
+        field = "username" if existing.username.lower() == user_data.username.lower() else "email"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"That {field} is already registered",
@@ -521,7 +526,8 @@ async def update_profile(
     if "username" in changes and changes["username"] != previous_username:
         clash = session.exec(
             select(UserDB).where(
-                UserDB.username == changes["username"], UserDB.id != current_user.id
+                func.lower(UserDB.username) == changes["username"].lower(),
+                UserDB.id != current_user.id,
             )
         ).first()
         if clash is not None:
@@ -532,7 +538,10 @@ async def update_profile(
 
     if "email" in changes:
         clash = session.exec(
-            select(UserDB).where(UserDB.email == changes["email"], UserDB.id != current_user.id)
+            select(UserDB).where(
+                func.lower(UserDB.email) == changes["email"].lower(),
+                UserDB.id != current_user.id,
+            )
         ).first()
         if clash is not None:
             raise HTTPException(

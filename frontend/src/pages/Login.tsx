@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,7 +11,11 @@ import { useAuth } from "@/contexts/AuthContext";
 import { api, ApiError } from "@/lib/api";
 
 const Login = () => {
-  const [username, setUsername] = useState("");
+  const location = useLocation();
+  // Prefilled when signup created the account but could not sign in.
+  const [username, setUsername] = useState(
+    (location.state as { username?: string } | null)?.username ?? "",
+  );
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();

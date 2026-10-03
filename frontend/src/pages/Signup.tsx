@@ -80,8 +80,21 @@ const Signup = () => {
         password: formData.password,
         account_type: formData.account_type as AccountType,
       });
+    } catch (error) {
+      toast({
+        title: "Signup Failed",
+        description: error instanceof ApiError ? error.message : "Failed to create account",
+        variant: "destructive",
+      });
+      setIsLoading(false);
+      return;
+    }
 
-      // Auto-login after signup
+    // The account exists from here on. If the automatic sign-in fails (a rate
+    // limit, a dropped connection), reporting "Signup Failed" would send the
+    // user back to sign up again, and the retry would hit a 409 for the
+    // username or email they have just registered.
+    try {
       const session = await api.login({
         username: formData.username.trim(),
         password: formData.password,
@@ -100,10 +113,13 @@ const Signup = () => {
       navigate("/dashboard", { replace: true });
     } catch (error) {
       toast({
-        title: "Signup Failed",
-        description: error instanceof ApiError ? error.message : "Failed to create account",
-        variant: "destructive",
+        title: "Account created",
+        description:
+          error instanceof ApiError && error.status === 429
+            ? "Your account is ready. Please wait a minute, then sign in."
+            : "Your account is ready. Please sign in.",
       });
+      navigate("/login", { replace: true, state: { username: formData.username.trim() } });
     } finally {
       setIsLoading(false);
     }
